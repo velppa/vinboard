@@ -329,6 +329,13 @@ test "search finds by title and tag" {
     try testing.expectEqual(@as(usize, 1), b.len);
 }
 
+/// Returns current Unix time in seconds.
+pub fn nowUnix() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
 /// Store archived text + status, then refresh FTS so body becomes searchable.
 pub fn setArchive(db: *sqlite.Db, id: i64, html: []const u8, text: []const u8, status: models.ArchiveStatus, now: i64) !void {
     var s = try db.prepare(
