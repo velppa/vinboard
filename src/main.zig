@@ -11,4 +11,5 @@ test "build sanity" {
 test {
     _ = @import("sqlite.zig");
     _ = @import("db.zig");
+    _ = @import("strip.zig");
 }
