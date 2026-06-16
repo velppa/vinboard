@@ -56,4 +56,5 @@ test {
     _ = @import("strip.zig");
     _ = @import("import.zig");
     _ = @import("archive.zig");
+    _ = @import("html.zig");
 }
