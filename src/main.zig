@@ -40,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
         .db = &db,
         .db_mutex = &mutex,
         .base_path = args.base_path,
+        .io = init.io,
     };
 
     var worker = archive.Worker{ .app = &app, .archiver_cmd = "single-file" };

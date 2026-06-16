@@ -7,6 +7,7 @@ pub const App = struct {
     db: *sqlite.Db,
     db_mutex: *std.Io.Mutex,
     base_path: []const u8,
+    io: std.Io,
 };
 
 pub fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
