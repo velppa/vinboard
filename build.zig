@@ -45,5 +45,9 @@ fn addSqlite(b: *std.Build, m: *std.Build.Module) void {
         .file = b.path("vendor/sqlite3.c"),
         .flags = &.{ "-DSQLITE_ENABLE_FTS5", "-DSQLITE_THREADSAFE=1" },
     });
+    m.addCSourceFile(.{
+        .file = b.path("vendor/sqlite3_helpers.c"),
+        .flags = &.{ "-DSQLITE_ENABLE_FTS5", "-DSQLITE_THREADSAFE=1" },
+    });
     m.link_libc = true;
 }

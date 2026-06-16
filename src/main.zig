@@ -7,3 +7,7 @@ pub fn main() !void {
 test "build sanity" {
     try std.testing.expect(1 + 1 == 2);
 }
+
+test {
+    _ = @import("sqlite.zig");
+}
