@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .root_module = test_module,
     });
     const run_tests = b.addRunArtifact(tests);
+    run_tests.setCwd(b.path("."));
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 }
 
