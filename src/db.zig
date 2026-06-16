@@ -329,6 +329,11 @@ test "search finds by title and tag" {
     try testing.expectEqual(@as(usize, 1), b.len);
 }
 
+/// Returns a prepared statement that yields (tag, count) rows ordered by count desc.
+pub fn prepareTagCounts(db: *sqlite.Db) !sqlite.Stmt {
+    return db.prepare("SELECT tag, count(*) c FROM tags GROUP BY tag ORDER BY c DESC, tag;");
+}
+
 /// Returns current Unix time in seconds.
 pub fn nowUnix() i64 {
     var ts: std.c.timespec = undefined;
