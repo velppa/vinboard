@@ -174,3 +174,115 @@ test "getBookmark returns struct with tags" {
     try testing.expectEqual(@as(usize, 2), bm.tags.len);
     try testing.expectEqualStrings("a", bm.tags[0]); // ordered
 }
+
+pub const ListFilter = struct {
+    tag: ?[]const u8 = null,
+    toread: ?bool = null,
+    shared: ?bool = null,
+    limit: i64 = 100,
+    offset: i64 = 0,
+};
+
+/// Returns ids most-recent-first. Caller frees the slice.
+pub fn listBookmarkIds(db: *sqlite.Db, alloc: std.mem.Allocator, f: ListFilter) ![]i64 {
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(alloc);
+    try sql.appendSlice(alloc, "SELECT DISTINCT b.id FROM bookmarks b");
+    if (f.tag != null) try sql.appendSlice(alloc, " JOIN tags t ON t.bookmark_id=b.id");
+    try sql.appendSlice(alloc, " WHERE 1=1");
+    if (f.tag != null) try sql.appendSlice(alloc, " AND t.tag=?1");
+    if (f.toread != null) try sql.appendSlice(alloc, " AND b.toread=?2");
+    if (f.shared != null) try sql.appendSlice(alloc, " AND b.shared=?3");
+    try sql.appendSlice(alloc, " ORDER BY b.created_at DESC LIMIT ?4 OFFSET ?5;");
+    const sqlz = try alloc.dupeZ(u8, sql.items);
+    defer alloc.free(sqlz);
+
+    var q = try db.prepare(sqlz);
+    defer q.finalize();
+    if (f.tag) |t| q.bindText(1, t);
+    if (f.toread) |v| q.bindInt(2, @intFromBool(v));
+    if (f.shared) |v| q.bindInt(3, @intFromBool(v));
+    q.bindInt(4, f.limit);
+    q.bindInt(5, f.offset);
+
+    var ids: std.ArrayList(i64) = .empty;
+    errdefer ids.deinit(alloc);
+    while (try q.step()) try ids.append(alloc, q.columnInt(0));
+    return ids.toOwnedSlice(alloc);
+}
+
+test "list filters by tag" {
+    var db = try testDb();
+    defer db.close();
+    _ = try insertBookmark(&db, .{ .url = "https://1", .tags = &.{"work"} }, 10);
+    _ = try insertBookmark(&db, .{ .url = "https://2", .tags = &.{"home"} }, 20);
+    const ids = try listBookmarkIds(&db, testing.allocator, .{ .tag = "work" });
+    defer testing.allocator.free(ids);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+}
+
+pub const Patch = struct {
+    title: ?[]const u8 = null,
+    notes: ?[]const u8 = null,
+    toread: ?bool = null,
+    shared: ?bool = null,
+    tags: ?[]const []const u8 = null,
+};
+
+pub fn updateBookmark(db: *sqlite.Db, id: i64, p: Patch, now: i64) !void {
+    if (p.title) |v| try setText(db, id, "title", v);
+    if (p.notes) |v| try setText(db, id, "notes", v);
+    if (p.toread) |v| try setInt(db, id, "toread", @intFromBool(v));
+    if (p.shared) |v| try setInt(db, id, "shared", @intFromBool(v));
+    if (p.tags) |tg| try replaceTags(db, id, tg);
+    try setInt(db, id, "updated_at", now);
+    try reindex(db, id);
+}
+
+fn setText(db: *sqlite.Db, id: i64, col: []const u8, v: []const u8) !void {
+    var buf: [64]u8 = undefined;
+    const sql = try std.fmt.bufPrintZ(&buf, "UPDATE bookmarks SET {s}=? WHERE id=?;", .{col});
+    var s = try db.prepare(sql);
+    defer s.finalize();
+    s.bindText(1, v);
+    s.bindInt(2, id);
+    _ = try s.step();
+}
+
+fn setInt(db: *sqlite.Db, id: i64, col: []const u8, v: i64) !void {
+    var buf: [64]u8 = undefined;
+    const sql = try std.fmt.bufPrintZ(&buf, "UPDATE bookmarks SET {s}=? WHERE id=?;", .{col});
+    var s = try db.prepare(sql);
+    defer s.finalize();
+    s.bindInt(1, v);
+    s.bindInt(2, id);
+    _ = try s.step();
+}
+
+pub fn deleteBookmark(db: *sqlite.Db, id: i64) !void {
+    var s = try db.prepare("DELETE FROM bookmarks WHERE id=?;");
+    defer s.finalize();
+    s.bindInt(1, id);
+    _ = try s.step();
+    try unindex(db, id);
+}
+
+// Temporary stub — real FTS removal body added in Task 5.
+fn unindex(db: *sqlite.Db, id: i64) !void {
+    _ = db;
+    _ = id;
+}
+
+test "update then delete" {
+    var db = try testDb();
+    defer db.close();
+    const id = try insertBookmark(&db, .{ .url = "https://u", .title = "old" }, 1);
+    try updateBookmark(&db, id, .{ .title = "new", .toread = true }, 2);
+    const bm = (try getBookmark(&db, testing.allocator, id)).?;
+    defer freeBookmark(testing.allocator, bm);
+    try testing.expectEqualStrings("new", bm.title);
+    try testing.expect(bm.toread);
+
+    try deleteBookmark(&db, id);
+    try testing.expect((try getBookmark(&db, testing.allocator, id)) == null);
+}
