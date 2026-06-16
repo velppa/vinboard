@@ -128,7 +128,7 @@ pub fn tags(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
     var arr: std.ArrayList(TagCount) = .empty;
     var st = db_mod.prepareTagCounts(app.db) catch |e| return dbError(res, e);
     defer st.finalize();
-    while (st.step() catch false) {
+    while (st.step() catch |e| return dbError(res, e)) {
         try arr.append(res.arena, .{
             .tag = try res.arena.dupe(u8, st.columnText(0)),
             .count = st.columnInt(1),
@@ -164,7 +164,8 @@ pub fn getArchive(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var q = app.db.prepare("SELECT html,status FROM archive WHERE bookmark_id=?;") catch |e| return dbError(res, e);
     defer q.finalize();
     q.bindInt(1, id);
-    if (!(q.step() catch false)) return notFound(res);
+    const has_row = q.step() catch |e| return dbError(res, e);
+    if (!has_row) return notFound(res);
     const html = q.columnText(0);
     res.status = 200;
     res.content_type = httpz.ContentType.HTML;
