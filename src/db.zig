@@ -29,7 +29,7 @@ pub const SCHEMA: [:0]const u8 =
     \\  status TEXT NOT NULL DEFAULT 'pending'
     \\);
     \\CREATE VIRTUAL TABLE IF NOT EXISTS bookmarks_fts USING fts5(
-    \\  title, notes, url, tags, body, content=''
+    \\  title, notes, url, tags, body, content='', contentless_delete=1
     \\);
 ;
 
@@ -276,23 +276,7 @@ pub fn deleteBookmark(db: *sqlite.Db, id: i64) !void {
 }
 
 fn unindex(db: *sqlite.Db, id: i64) !void {
-    // For a contentless FTS5 table the delete command requires the original
-    // column values AND the row must already be in the index (issuing a delete
-    // command for a non-existent rowid corrupts the FTS index).
-    // Guard via the bookmarks_fts_docsize shadow table which tracks every indexed row.
-    var chk = try db.prepare("SELECT count(*) FROM bookmarks_fts_docsize WHERE id=?;");
-    defer chk.finalize();
-    chk.bindInt(1, id);
-    if (!try chk.step()) return;
-    if (chk.columnInt(0) == 0) return;
-
-    var del = try db.prepare(
-        \\INSERT INTO bookmarks_fts(bookmarks_fts, rowid, title, notes, url, tags, body)
-        \\SELECT 'delete', b.id, b.title, b.notes, b.url,
-        \\  COALESCE((SELECT group_concat(tag,' ') FROM tags WHERE bookmark_id=b.id),''),
-        \\  COALESCE((SELECT text FROM archive WHERE bookmark_id=b.id),'')
-        \\FROM bookmarks b WHERE b.id=?;
-    );
+    var del = try db.prepare("DELETE FROM bookmarks_fts WHERE rowid=?;");
     defer del.finalize();
     del.bindInt(1, id);
     _ = try del.step();
@@ -341,8 +325,6 @@ test "search finds by title and tag" {
 
 /// Store archived text + status, then refresh FTS so body becomes searchable.
 pub fn setArchive(db: *sqlite.Db, id: i64, html: []const u8, text: []const u8, status: models.ArchiveStatus, now: i64) !void {
-    // Unindex before mutating archive so the delete command uses the original indexed values.
-    try unindex(db, id);
     var s = try db.prepare(
         "INSERT INTO archive(bookmark_id,html,text,fetched_at,status) VALUES (?,?,?,?,?) " ++
         "ON CONFLICT(bookmark_id) DO UPDATE SET html=excluded.html,text=excluded.text,fetched_at=excluded.fetched_at,status=excluded.status;",
@@ -354,17 +336,7 @@ pub fn setArchive(db: *sqlite.Db, id: i64, html: []const u8, text: []const u8, s
     s.bindInt(4, now);
     s.bindText(5, @tagName(status));
     _ = try s.step();
-    // Insert directly (skip the unindex in reindex since we already unindexed above).
-    var ins = try db.prepare(
-        \\INSERT INTO bookmarks_fts(rowid,title,notes,url,tags,body)
-        \\SELECT b.id, b.title, b.notes, b.url,
-        \\  COALESCE((SELECT group_concat(tag,' ') FROM tags WHERE bookmark_id=b.id),''),
-        \\  COALESCE((SELECT text FROM archive WHERE bookmark_id=b.id),'')
-        \\FROM bookmarks b WHERE b.id=?;
-    );
-    defer ins.finalize();
-    ins.bindInt(1, id);
-    _ = try ins.step();
+    try reindex(db, id);
 }
 
 test "archived text becomes searchable" {
