@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+*.db
+*.db-journal
+*.db-wal
+zig-pkg/

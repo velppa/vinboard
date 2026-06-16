@@ -1,0 +1,13 @@
+.{
+    .name = .vinboard,
+    .version = "0.1.0",
+    .fingerprint = 0xbdb9fc380cd231a3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .httpz = .{
+            .url = "git+https://github.com/karlseguin/http.zig#5f60277d3b3beffef86321869b13c57f7acc3c5b",
+            .hash = "httpz-0.0.0-PNVzrJrbCACyokt2AARAG7Ul7h7xlZxL7BYAdpsAs1_-",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "vendor" },
+}
