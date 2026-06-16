@@ -96,10 +96,18 @@ fn replaceTags(db: *sqlite.Db, id: i64, tags: []const []const u8) !void {
     }
 }
 
-// Temporary stub — real FTS sync body is added in a later task (Task 5).
 fn reindex(db: *sqlite.Db, id: i64) !void {
-    _ = db;
-    _ = id;
+    try unindex(db, id);
+    var ins = try db.prepare(
+        \\INSERT INTO bookmarks_fts(rowid,title,notes,url,tags,body)
+        \\SELECT b.id, b.title, b.notes, b.url,
+        \\  COALESCE((SELECT group_concat(tag,' ') FROM tags WHERE bookmark_id=b.id),''),
+        \\  COALESCE((SELECT text FROM archive WHERE bookmark_id=b.id),'')
+        \\FROM bookmarks b WHERE b.id=?;
+    );
+    defer ins.finalize();
+    ins.bindInt(1, id);
+    _ = try ins.step();
 }
 
 test "insert and read back a bookmark" {
@@ -260,17 +268,34 @@ fn setInt(db: *sqlite.Db, id: i64, col: []const u8, v: i64) !void {
 }
 
 pub fn deleteBookmark(db: *sqlite.Db, id: i64) !void {
+    try unindex(db, id);
     var s = try db.prepare("DELETE FROM bookmarks WHERE id=?;");
     defer s.finalize();
     s.bindInt(1, id);
     _ = try s.step();
-    try unindex(db, id);
 }
 
-// Temporary stub — real FTS removal body added in Task 5.
 fn unindex(db: *sqlite.Db, id: i64) !void {
-    _ = db;
-    _ = id;
+    // For a contentless FTS5 table the delete command requires the original
+    // column values AND the row must already be in the index (issuing a delete
+    // command for a non-existent rowid corrupts the FTS index).
+    // Guard via the bookmarks_fts_docsize shadow table which tracks every indexed row.
+    var chk = try db.prepare("SELECT count(*) FROM bookmarks_fts_docsize WHERE id=?;");
+    defer chk.finalize();
+    chk.bindInt(1, id);
+    if (!try chk.step()) return;
+    if (chk.columnInt(0) == 0) return;
+
+    var del = try db.prepare(
+        \\INSERT INTO bookmarks_fts(bookmarks_fts, rowid, title, notes, url, tags, body)
+        \\SELECT 'delete', b.id, b.title, b.notes, b.url,
+        \\  COALESCE((SELECT group_concat(tag,' ') FROM tags WHERE bookmark_id=b.id),''),
+        \\  COALESCE((SELECT text FROM archive WHERE bookmark_id=b.id),'')
+        \\FROM bookmarks b WHERE b.id=?;
+    );
+    defer del.finalize();
+    del.bindInt(1, id);
+    _ = try del.step();
 }
 
 test "update then delete" {
@@ -285,4 +310,69 @@ test "update then delete" {
 
     try deleteBookmark(&db, id);
     try testing.expect((try getBookmark(&db, testing.allocator, id)) == null);
+}
+
+/// FTS search; returns matching ids best-match-first. Caller frees.
+pub fn search(db: *sqlite.Db, alloc: std.mem.Allocator, query: []const u8, limit: i64) ![]i64 {
+    var q = try db.prepare("SELECT rowid FROM bookmarks_fts WHERE bookmarks_fts MATCH ? ORDER BY rank LIMIT ?;");
+    defer q.finalize();
+    q.bindText(1, query);
+    q.bindInt(2, limit);
+    var ids: std.ArrayList(i64) = .empty;
+    errdefer ids.deinit(alloc);
+    while (try q.step()) try ids.append(alloc, q.columnInt(0));
+    return ids.toOwnedSlice(alloc);
+}
+
+test "search finds by title and tag" {
+    var db = try testDb();
+    defer db.close();
+    _ = try insertBookmark(&db, .{ .url = "https://zig", .title = "Zig language", .tags = &.{"programming"} }, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://cook", .title = "Cooking", .tags = &.{"food"} }, 2);
+
+    const a = try search(&db, testing.allocator, "zig", 10);
+    defer testing.allocator.free(a);
+    try testing.expectEqual(@as(usize, 1), a.len);
+
+    const b = try search(&db, testing.allocator, "programming", 10);
+    defer testing.allocator.free(b);
+    try testing.expectEqual(@as(usize, 1), b.len);
+}
+
+/// Store archived text + status, then refresh FTS so body becomes searchable.
+pub fn setArchive(db: *sqlite.Db, id: i64, html: []const u8, text: []const u8, status: models.ArchiveStatus, now: i64) !void {
+    // Unindex before mutating archive so the delete command uses the original indexed values.
+    try unindex(db, id);
+    var s = try db.prepare(
+        "INSERT INTO archive(bookmark_id,html,text,fetched_at,status) VALUES (?,?,?,?,?) " ++
+        "ON CONFLICT(bookmark_id) DO UPDATE SET html=excluded.html,text=excluded.text,fetched_at=excluded.fetched_at,status=excluded.status;",
+    );
+    defer s.finalize();
+    s.bindInt(1, id);
+    s.bindText(2, html);
+    s.bindText(3, text);
+    s.bindInt(4, now);
+    s.bindText(5, @tagName(status));
+    _ = try s.step();
+    // Insert directly (skip the unindex in reindex since we already unindexed above).
+    var ins = try db.prepare(
+        \\INSERT INTO bookmarks_fts(rowid,title,notes,url,tags,body)
+        \\SELECT b.id, b.title, b.notes, b.url,
+        \\  COALESCE((SELECT group_concat(tag,' ') FROM tags WHERE bookmark_id=b.id),''),
+        \\  COALESCE((SELECT text FROM archive WHERE bookmark_id=b.id),'')
+        \\FROM bookmarks b WHERE b.id=?;
+    );
+    defer ins.finalize();
+    ins.bindInt(1, id);
+    _ = try ins.step();
+}
+
+test "archived text becomes searchable" {
+    var db = try testDb();
+    defer db.close();
+    const id = try insertBookmark(&db, .{ .url = "https://p", .title = "Plain" }, 1);
+    try setArchive(&db, id, "<html>x</html>", "elephant zebra", .done, 2);
+    const hits = try search(&db, testing.allocator, "zebra", 10);
+    defer testing.allocator.free(hits);
+    try testing.expectEqual(@as(usize, 1), hits.len);
 }
