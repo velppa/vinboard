@@ -1,9 +1,7 @@
 const std = @import("std");
 const server = @import("server.zig");
 const db_mod = @import("db.zig");
-const sqlite = @import("sqlite.zig");
 const strip = @import("strip.zig");
-const models = @import("models.zig");
 
 pub const Worker = struct {
     app: *server.App,
@@ -64,7 +62,6 @@ pub const Worker = struct {
         });
         // Always free stderr; we don't use it.
         self.app.gpa.free(result.stderr);
-        errdefer self.app.gpa.free(result.stdout);
         switch (result.term) {
             .exited => |code| {
                 if (code != 0) {
@@ -110,4 +107,39 @@ test "worker archives a pending bookmark via stub" {
     const hits = try db_mod.search(&db, testing.allocator, "lorem", 10);
     defer testing.allocator.free(hits);
     try testing.expectEqual(@as(usize, 1), hits.len);
+}
+
+test "worker marks a bookmark failed when archiver exits non-zero" {
+    var db = try db_mod.testDbPub();
+    defer db.close();
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var mutex: std.Io.Mutex = .init;
+    var app = server.App{
+        .gpa = testing.allocator,
+        .db = &db,
+        .db_mutex = &mutex,
+        .io = io,
+        .base_path = "",
+    };
+
+    const id = try db_mod.insertBookmark(&db, .{ .url = "https://fail.test", .title = "F" }, 1);
+    try db_mod.setArchive(&db, id, "", "", .pending, 1);
+
+    // The fixture writes to stdout then exits 1. tick() must complete without
+    // crashing (no double-free) and record the failure.
+    var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/fail-archiver.sh" };
+    try w.tick();
+
+    var q = try db.prepare("SELECT status FROM archive WHERE bookmark_id=?;");
+    defer q.finalize();
+    q.bindInt(1, id);
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("failed", q.columnText(0));
+
+    // No pending rows should remain, so a second tick is a no-op.
+    try w.tick();
 }
