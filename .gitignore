@@ -4,3 +4,4 @@ zig-out/
 *.db-journal
 *.db-wal
 zig-pkg/
+*.elc
