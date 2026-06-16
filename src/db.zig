@@ -44,6 +44,12 @@ fn testDb() !sqlite.Db {
     return db;
 }
 
+pub fn testDbPub() !sqlite.Db {
+    var db = try sqlite.Db.openMemory();
+    try migrate(&db);
+    return db;
+}
+
 test "migrate creates tables" {
     var db = try testDb();
     defer db.close();
