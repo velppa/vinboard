@@ -55,19 +55,15 @@ pub fn listFragment(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     const q = qs.get("q");
 
     app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+
     const ids = blk: {
         if (q) |term| {
             if (term.len > 0) {
-                break :blk db_mod.search(app.db, res.arena, term, 100) catch |e| {
-                    app.db_mutex.unlock(app.io);
-                    return serverError(res, e);
-                };
+                break :blk db_mod.search(app.db, res.arena, term, 100) catch |e| return serverError(res, e);
             }
         }
-        break :blk db_mod.listBookmarkIds(app.db, res.arena, .{}) catch |e| {
-            app.db_mutex.unlock(app.io);
-            return serverError(res, e);
-        };
+        break :blk db_mod.listBookmarkIds(app.db, res.arena, .{}) catch |e| return serverError(res, e);
     };
 
     var buf: std.ArrayList(u8) = .empty;
@@ -76,20 +72,11 @@ pub fn listFragment(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     } else {
         try buf.appendSlice(res.arena, "<ul class=\"space-y-1\">");
         for (ids) |id| {
-            const bm = db_mod.getBookmark(app.db, res.arena, id) catch |e| {
-                app.db_mutex.unlock(app.io);
-                return serverError(res, e);
-            } orelse continue;
+            const bm = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return serverError(res, e)) orelse continue;
 
             const display = if (bm.title.len > 0) bm.title else bm.url;
-            const esc_title = html.escape(res.arena, display) catch |e| {
-                app.db_mutex.unlock(app.io);
-                return serverError(res, e);
-            };
-            const esc_url = html.escape(res.arena, bm.url) catch |e| {
-                app.db_mutex.unlock(app.io);
-                return serverError(res, e);
-            };
+            const esc_title = try html.escape(res.arena, display);
+            const esc_url = try html.escape(res.arena, bm.url);
 
             const li = try std.fmt.allocPrint(res.arena,
                 \\<li><a class="text-blue-600 hover:underline" href="{s}">{s}</a> <a class="text-xs text-gray-400 hover:underline" href="{s}/api/bookmarks/{d}/archive">[archived]</a></li>
@@ -98,7 +85,6 @@ pub fn listFragment(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
         }
         try buf.appendSlice(res.arena, "</ul>");
     }
-    app.db_mutex.unlock(app.io);
 
     res.content_type = httpz.ContentType.HTML;
     res.body = buf.items;
