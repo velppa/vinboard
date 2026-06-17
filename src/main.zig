@@ -57,4 +57,5 @@ test {
     _ = @import("import.zig");
     _ = @import("archive.zig");
     _ = @import("html.zig");
+    _ = @import("pinboard_compat.zig");
 }

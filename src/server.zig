@@ -27,6 +27,7 @@ pub fn start(app: *App, io: std.Io, port: u16) !void {
     router.get("/api/health", health, .{});
     @import("api.zig").registerRoutes(&router);
     @import("web.zig").registerRoutes(&router);
+    @import("pinboard_compat.zig").registerRoutes(&router);
     std.log.info("vinboard listening on :{d}", .{port});
     try server.listen();
 }

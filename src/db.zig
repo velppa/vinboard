@@ -273,6 +273,15 @@ fn setInt(db: *sqlite.Db, id: i64, col: []const u8, v: i64) !void {
     _ = try s.step();
 }
 
+/// Returns the id of a bookmark with the given url, or null if not found.
+pub fn findIdByUrl(db: *sqlite.Db, url: []const u8) !?i64 {
+    var q = try db.prepare("SELECT id FROM bookmarks WHERE url=? LIMIT 1;");
+    defer q.finalize();
+    q.bindText(1, url);
+    if (!try q.step()) return null;
+    return q.columnInt(0);
+}
+
 pub fn deleteBookmark(db: *sqlite.Db, id: i64) !void {
     try unindex(db, id);
     var s = try db.prepare("DELETE FROM bookmarks WHERE id=?;");

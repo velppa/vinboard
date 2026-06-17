@@ -43,7 +43,7 @@ pub fn parsePinboard(gpa: std.mem.Allocator, json: []const u8) !Imported {
 }
 
 /// Minimal ISO-8601 "YYYY-MM-DDThh:mm:ssZ" → unix seconds.
-fn parseIso(s: []const u8) i64 {
+pub fn parseIso(s: []const u8) i64 {
     if (s.len < 20) return 0;
     const y = std.fmt.parseInt(i64, s[0..4], 10) catch return 0;
     const mo = std.fmt.parseInt(i64, s[5..7], 10) catch return 0;
