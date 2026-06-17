@@ -16,7 +16,11 @@ pub fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
 }
 
 pub fn start(app: *App, io: std.Io, port: u16) !void {
-    var server = try httpz.Server(*App).init(io, app.gpa, .{ .address = .localhost(port) }, app);
+    var server = try httpz.Server(*App).init(io, app.gpa, .{
+        .address = .localhost(port),
+        // default is 1 MiB; bookmark imports (Pinboard posts/all) can exceed that.
+        .request = .{ .max_body_size = 32 * 1024 * 1024 },
+    }, app);
     defer server.stop();
     defer server.deinit();
     var router = try server.router(.{});
