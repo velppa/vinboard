@@ -28,6 +28,15 @@ pub fn start(app: *App, io: std.Io, port: u16) !void {
     @import("api.zig").registerRoutes(&router);
     @import("web.zig").registerRoutes(&router);
     @import("pinboard_compat.zig").registerRoutes(&router);
+    // Pages emit base_path-prefixed urls; a reverse proxy strips the prefix,
+    // but direct access needs the same routes at the prefixed paths too.
+    if (app.base_path.len > 0) {
+        var group = router.group(app.base_path, .{});
+        group.get("/api/health", health, .{});
+        @import("api.zig").registerRoutes(&group);
+        @import("web.zig").registerRoutes(&group);
+        @import("pinboard_compat.zig").registerRoutes(&group);
+    }
     std.log.info("vinboard listening on :{d}", .{port});
     try server.listen();
 }

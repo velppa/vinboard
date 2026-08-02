@@ -7,6 +7,7 @@ pub const Bookmark = struct {
     updated_at: i64,
     toread: bool,
     shared: bool,
+    starred: bool = false,
     tags: [][]const u8 = &.{},
 };
 

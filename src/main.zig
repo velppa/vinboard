@@ -3,11 +3,14 @@ const sqlite = @import("sqlite.zig");
 const db_mod = @import("db.zig");
 const server = @import("server.zig");
 const archive = @import("archive.zig");
+const auth = @import("auth.zig");
 
 const Args = struct {
     db: [:0]const u8 = "vinboard.db",
     port: u16 = 4670,
     base_path: []const u8 = "",
+    archiver: []const u8 = "single-file",
+    set_password: ?[2][]const u8 = null, // handle, password
 };
 
 const usage =
@@ -19,6 +22,9 @@ const usage =
     \\  --db <path>         sqlite database file (default: vinboard.db)
     \\  --port <port>       listen port (default: 4670)
     \\  --base-path <path>  url prefix emitted in pages, for reverse proxies (default: none)
+    \\  --archiver <cmd>    page archiver command, must print html to stdout (default: single-file)
+    \\  --set-password <handle> <password>
+    \\                      set a user's password and exit
     \\  --help              show this help and exit
     \\
 ;
@@ -34,6 +40,12 @@ fn parseArgs(alloc: std.mem.Allocator, args: std.process.Args) !Args {
             a.port = try std.fmt.parseInt(u16, it.next() orelse return error.MissingArgValue, 10);
         } else if (std.mem.eql(u8, arg, "--base-path")) {
             a.base_path = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
+        } else if (std.mem.eql(u8, arg, "--archiver")) {
+            a.archiver = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
+        } else if (std.mem.eql(u8, arg, "--set-password")) {
+            const handle = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
+            const password = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
+            a.set_password = .{ handle, password };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -53,6 +65,14 @@ pub fn main(init: std.process.Init) !void {
     defer db.close();
     try db_mod.migrate(&db);
 
+    if (args.set_password) |hp| {
+        var buf: [auth.hash_buf_len]u8 = undefined;
+        const hash = try auth.hashPassword(hp[1], &buf, init.io);
+        try db_mod.setUserPassword(&db, hp[0], hash);
+        std.debug.print("password set for {s}\n", .{hp[0]});
+        return;
+    }
+
     var mutex = std.Io.Mutex.init;
     var app = server.App{
         .gpa = gpa,
@@ -62,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
         .io = init.io,
     };
 
-    var worker = archive.Worker{ .app = &app, .archiver_cmd = "single-file" };
+    var worker = archive.Worker{ .app = &app, .archiver_cmd = args.archiver };
     const th = try std.Thread.spawn(.{}, archive.Worker.run, .{&worker});
     th.detach();
 
@@ -78,4 +98,5 @@ test {
     _ = @import("html.zig");
     _ = @import("pinboard_compat.zig");
     _ = @import("web.zig");
+    _ = @import("auth.zig");
 }

@@ -38,25 +38,26 @@ sees plain /api/… paths after Caddy strips the prefix."
   :type 'string
   :group 'vinboard)
 
-(defcustom vinboard-token "uery3721lkjKd"
-  "Query-parameter token used to authenticate every vinboard request."
+(defcustom vinboard-token ""
+  "API token in the form \"<username>:TOKEN\".
+Generate it on the vinboard Setup page; sent as a bearer token."
   :type 'string
   :group 'vinboard)
 
 ;;;; Internal helpers
 
 (defun vinboard--url (path &optional query)
-  "Build a full vinboard URL for PATH with the auth token and optional QUERY.
-QUERY is an alist of (KEY . VALUE) pairs appended as &KEY=VALUE."
+  "Build a full vinboard URL for PATH with optional QUERY.
+QUERY is an alist of (KEY . VALUE) pairs appended as KEY=VALUE."
   (concat vinboard-base-url
           path
-          "?token=" (url-hexify-string vinboard-token)
+          (when query "?")
           (mapconcat (lambda (kv)
-                       (format "&%s=%s"
+                       (format "%s=%s"
                                (car kv)
                                (url-hexify-string (format "%s" (cdr kv)))))
                      query
-                     "")))
+                     "&")))
 
 (defun vinboard--request (method path &optional body query)
   "Send an HTTP METHOD request to PATH with optional BODY and QUERY params.
@@ -64,7 +65,9 @@ BODY, when non-nil, is JSON-encoded and sent as the request body.
 QUERY is an alist appended to the URL query string.
 Returns the parsed JSON response (alist / list), or nil on empty body."
   (let* ((url-request-method method)
-         (url-request-extra-headers '(("Content-Type" . "application/json")))
+         (url-request-extra-headers
+          `(("Content-Type" . "application/json")
+            ("Authorization" . ,(concat "Bearer " vinboard-token))))
          (url-request-data (when body
                              (encode-coding-string (json-encode body) 'utf-8))))
     (with-current-buffer

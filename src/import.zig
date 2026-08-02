@@ -105,7 +105,7 @@ fn unixNow() i64 {
 }
 
 fn urlExists(db: *sqlite.Db, url: []const u8) !bool {
-    var q = try db.prepare("SELECT 1 FROM bookmarks WHERE url=? LIMIT 1;");
+    var q = try db.prepare("SELECT 1 FROM bookmark WHERE url=? LIMIT 1;");
     defer q.finalize();
     q.bindText(1, url);
     return try q.step();

@@ -6,6 +6,10 @@ const strip = @import("strip.zig");
 pub const Worker = struct {
     app: *server.App,
     archiver_cmd: []const u8, // "single-file" in prod; a fixture script in tests
+    // Hard cap on one archiver run; 0 disables the `timeout` wrapper (tests).
+    // Some pages hang the archiver past its own deadlines, which would stall
+    // the whole queue (nextPending always picks the same row).
+    timeout_secs: u32 = 180,
     poll_ms: u64 = 2000,
     stop: bool = false,
 
@@ -40,7 +44,7 @@ pub const Worker = struct {
         self.app.db_mutex.lockUncancelable(self.app.io);
         defer self.app.db_mutex.unlock(self.app.io);
         var q = try self.app.db.prepare(
-            "SELECT a.bookmark_id, b.url FROM archive a JOIN bookmarks b ON b.id=a.bookmark_id WHERE a.status='pending' LIMIT 1;",
+            "SELECT a.bookmark_id, b.url FROM archive a JOIN bookmark b ON b.id=a.bookmark_id WHERE a.status='pending' LIMIT 1;",
         );
         defer q.finalize();
         if (!try q.step()) return null;
@@ -55,8 +59,14 @@ pub const Worker = struct {
 
     /// Run the archiver, capture stdout HTML. Caller frees.
     fn fetch(self: *Worker, url: []const u8) ![]u8 {
+        var secs_buf: [16]u8 = undefined;
+        const secs = try std.fmt.bufPrint(&secs_buf, "{d}", .{self.timeout_secs});
+        const argv: []const []const u8 = if (self.timeout_secs > 0)
+            &.{ "timeout", secs, self.archiver_cmd, url, "--dump-content" }
+        else
+            &.{ self.archiver_cmd, url, "--dump-content" };
         const result = try std.process.run(self.app.gpa, self.app.io, .{
-            .argv = &.{ self.archiver_cmd, url },
+            .argv = argv,
             .stdout_limit = .limited(32 * 1024 * 1024),
             .stderr_limit = .limited(1024),
         });
@@ -101,7 +111,7 @@ test "worker archives a pending bookmark via stub" {
     const id = try db_mod.insertBookmark(&db, .{ .url = "https://w.test", .title = "W" }, 1);
     try db_mod.setArchive(&db, id, "", "", .pending, 1);
 
-    var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/fake-archiver.sh" };
+    var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/fake-archiver.sh", .timeout_secs = 0 };
     try w.tick();
 
     const hits = try db_mod.search(&db, testing.allocator, "lorem", 10);
@@ -131,7 +141,7 @@ test "worker marks a bookmark failed when archiver exits non-zero" {
 
     // The fixture writes to stdout then exits 1. tick() must complete without
     // crashing (no double-free) and record the failure.
-    var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/fail-archiver.sh" };
+    var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/fail-archiver.sh", .timeout_secs = 0 };
     try w.tick();
 
     var q = try db.prepare("SELECT status FROM archive WHERE bookmark_id=?;");

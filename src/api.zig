@@ -5,6 +5,38 @@ const db_mod = @import("db.zig");
 const models = @import("models.zig");
 
 const App = server.App;
+const auth = @import("auth.zig");
+
+/// Authenticated api user: Bearer/auth_token "handle:TOKEN", or a web session
+/// cookie. Caller holds the db lock. Null means unauthorized.
+pub fn apiUserId(app: *App, req: *httpz.Request) ?i64 {
+    if (req.header("authorization")) |h| {
+        if (h.len > 7 and std.ascii.eqlIgnoreCase(h[0..7], "bearer ")) {
+            if (credUser(app, std.mem.trim(u8, h[7..], " "))) |uid| return uid;
+        }
+    }
+    if (req.query() catch null) |qs| {
+        if (qs.get("auth_token")) |cred| {
+            if (credUser(app, cred)) |uid| return uid;
+        }
+    }
+    if (req.header("cookie")) |c| {
+        if (auth.cookieValue(c, "vb_session")) |tok| {
+            if (db_mod.sessionUser(app.db, tok, db_mod.nowUnix()) catch null) |uid| return uid;
+        }
+    }
+    return null;
+}
+
+fn credUser(app: *App, cred: []const u8) ?i64 {
+    const colon = std.mem.indexOfScalar(u8, cred, ':') orelse return null;
+    return db_mod.userIdByToken(app.db, cred[0..colon], cred[colon + 1 ..]) catch null;
+}
+
+pub fn unauthorized(res: *httpz.Response) !void {
+    res.status = 401;
+    try res.json(.{ .@"error" = "unauthorized" }, .{});
+}
 
 pub fn registerRoutes(router: anytype) void {
     router.*.post("/api/bookmarks", create, .{});
@@ -32,6 +64,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const now = db_mod.nowUnix();
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     const id = db_mod.insertBookmark(app.db, .{
         .url = body.url,
         .title = body.title,
@@ -51,10 +84,12 @@ pub fn list(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (qs.get("tag")) |t| f.tag = t;
     if (qs.get("toread")) |v| f.toread = isTrue(v);
     if (qs.get("shared")) |v| f.shared = isTrue(v);
+    if (qs.get("starred")) |v| f.starred = isTrue(v);
     if (qs.get("limit")) |v| f.limit = std.fmt.parseInt(i64, v, 10) catch 100;
     if (qs.get("offset")) |v| f.offset = std.fmt.parseInt(i64, v, 10) catch 0;
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     const ids = db_mod.listBookmarkIds(app.db, res.arena, f) catch |e| return dbError(res, e);
     try writeBookmarkArray(app, res, ids);
 }
@@ -76,6 +111,7 @@ pub fn get(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res, "bad id");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     const bm = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
     res.status = 200;
     try res.json(bm, .{});
@@ -86,6 +122,7 @@ const PatchBody = struct {
     notes: ?[]const u8 = null,
     toread: ?bool = null,
     shared: ?bool = null,
+    starred: ?bool = null,
     tags: ?[]const []const u8 = null,
 };
 
@@ -94,11 +131,13 @@ pub fn patch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const body = (try req.json(PatchBody)) orelse return badRequest(res, "invalid json");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     db_mod.updateBookmark(app.db, id, .{
         .title = body.title,
         .notes = body.notes,
         .toread = body.toread,
         .shared = body.shared,
+        .starred = body.starred,
         .tags = body.tags,
     }, db_mod.nowUnix()) catch |e| return dbError(res, e);
     res.status = 204;
@@ -108,6 +147,7 @@ pub fn remove(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res, "bad id");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     db_mod.deleteBookmark(app.db, id) catch |e| return dbError(res, e);
     res.status = 204;
 }
@@ -117,13 +157,15 @@ pub fn searchH(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const term = qs.get("q") orelse return badRequest(res, "missing q");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     const ids = db_mod.search(app.db, res.arena, term, 100) catch |e| return dbError(res, e);
     try writeBookmarkArray(app, res, ids);
 }
 
-pub fn tags(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
+pub fn tags(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     const TagCount = struct { tag: []const u8, count: i64 };
     var arr: std.ArrayList(TagCount) = .empty;
     var st = db_mod.prepareTagCounts(app.db) catch |e| return dbError(res, e);
@@ -152,6 +194,7 @@ pub fn importH(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer imp.deinit();
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     const n = importer.importInto(app.db, imp) catch |e| return dbError(res, e);
     res.status = 200;
     try res.json(.{ .imported = n }, .{});
@@ -161,6 +204,7 @@ pub fn getArchive(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res, "bad id");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (apiUserId(app, req) == null) return unauthorized(res);
     var q = app.db.prepare("SELECT html,status FROM archive WHERE bookmark_id=?;") catch |e| return dbError(res, e);
     defer q.finalize();
     q.bindInt(1, id);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const server = @import("server.zig");
+const api = @import("api.zig");
 const db_mod = @import("db.zig");
 const import_mod = @import("import.zig");
 
@@ -10,15 +11,17 @@ pub fn registerRoutes(router: anytype) void {
     router.*.get("/v1/posts/update", postsUpdate, .{});
     router.*.get("/v1/posts/all", postsAll, .{});
     router.*.get("/v1/posts/add", postsAdd, .{});
+    router.*.post("/v1/posts/add", postsAdd, .{});
     router.*.get("/v1/posts/delete", postsDelete, .{});
 }
 
 // GET /v1/posts/update → {"update_time":"<ISO8601>"}
-fn postsUpdate(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
+fn postsUpdate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
 
-    var q = try app.db.prepare("SELECT MAX(updated_at) FROM bookmarks;");
+    var q = try app.db.prepare("SELECT MAX(updated_at) FROM bookmark;");
     defer q.finalize();
     const has_row = try q.step();
     const unix: i64 = if (has_row) q.columnInt(0) else db_mod.nowUnix();
@@ -38,6 +41,7 @@ fn postsAll(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
 
     const ids = try db_mod.listBookmarkIds(app.db, res.arena, .{
         .tag = tag,
@@ -123,6 +127,7 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
 
     if (try db_mod.findIdByUrl(app.db, url)) |existing_id| {
         // URL exists
@@ -166,6 +171,7 @@ fn postsDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
 
     if (try db_mod.findIdByUrl(app.db, url)) |id| {
         try db_mod.deleteBookmark(app.db, id);
