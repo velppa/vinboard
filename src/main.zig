@@ -10,17 +10,36 @@ const Args = struct {
     base_path: []const u8 = "",
 };
 
+const usage =
+    \\vinboard — personal bookmark server
+    \\
+    \\usage: vinboard [options]
+    \\
+    \\options:
+    \\  --db <path>         sqlite database file (default: vinboard.db)
+    \\  --port <port>       listen port (default: 4670)
+    \\  --base-path <path>  url prefix emitted in pages, for reverse proxies (default: none)
+    \\  --help              show this help and exit
+    \\
+;
+
 fn parseArgs(alloc: std.mem.Allocator, args: std.process.Args) !Args {
     var a = Args{};
     var it = args.iterate();
     _ = it.next(); // exe name
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--db")) {
-            a.db = try alloc.dupeZ(u8, it.next().?);
+            a.db = try alloc.dupeZ(u8, it.next() orelse return error.MissingArgValue);
         } else if (std.mem.eql(u8, arg, "--port")) {
-            a.port = try std.fmt.parseInt(u16, it.next().?, 10);
+            a.port = try std.fmt.parseInt(u16, it.next() orelse return error.MissingArgValue, 10);
         } else if (std.mem.eql(u8, arg, "--base-path")) {
-            a.base_path = try alloc.dupe(u8, it.next().?);
+            a.base_path = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print("{s}", .{usage});
+            std.process.exit(0);
+        } else {
+            std.debug.print("unknown option: {s}\n\n{s}", .{ arg, usage });
+            std.process.exit(1);
         }
     }
     return a;
