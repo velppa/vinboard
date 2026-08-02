@@ -1,15 +1,16 @@
 # vinboard — build & deploy
-# Zig 0.16.0 via mise (system zig is the broken 0.15.2 on macOS 27).
-ZIG  ?= $(HOME)/.local/share/mise/installs/zig/0.16.0/zig
-DB   ?= $(HOME)/vinboard/vinboard.db
+ZIG  ?= zig
+DB   ?= $(HOME)/.local/state/vinboard/vinboard.db
 PORT ?= 4670
 # Ensure the spawned archiver (single-file) resolves; it lives on the mise shim path.
 SHIMS = $(HOME)/.local/share/mise/shims
 
+export NO_COLOR=1
+
 .PHONY: build test run start-vinboard stop-vinboard install-deps
 
 build:
-	$(ZIG) build -Doptimize=ReleaseSafe
+	$(ZIG) build --summary none -Doptimize=ReleaseSafe
 
 test:
 	$(ZIG) build test --summary all
@@ -19,12 +20,12 @@ run: build
 
 # Run detached under dtach (same pattern as Textpod). PATH carries the mise
 # shims so the archive worker can exec `single-file`.
-start-vinboard: build
+start: build
 	mkdir -p $(HOME)/vinboard
 	dtach -n /tmp/vinboard.sock env PATH="$(SHIMS):$$PATH" \
 	  ./zig-out/bin/vinboard --db $(DB) --port $(PORT) --base-path /vinboard
 
-stop-vinboard:
+stop:
 	-pkill -f 'zig-out/bin/vinboard'
 
 # Archiver: single-file drives headless Chrome — Chrome/Chromium must be
