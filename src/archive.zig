@@ -22,12 +22,12 @@ pub const Worker = struct {
         }
     }
 
-    /// Process one pending row, if any. Public so tests can call it directly.
+    /// Process one pending url, if any. Public so tests can call it directly.
     pub fn tick(self: *Worker) !void {
-        const job = (try self.nextPending()) orelse return;
-        defer self.app.gpa.free(job.url);
-        const html = self.fetch(job.url) catch {
-            try self.markFailed(job.id);
+        const url = (try self.nextPending()) orelse return;
+        defer self.app.gpa.free(url);
+        const html = self.fetch(url) catch |e| {
+            try self.markFailed(url, if (e == error.DeadLink) .dead else .failed);
             return;
         };
         defer self.app.gpa.free(html);
@@ -35,26 +35,39 @@ pub const Worker = struct {
         defer self.app.gpa.free(text);
         self.app.db_mutex.lockUncancelable(self.app.io);
         defer self.app.db_mutex.unlock(self.app.io);
-        try db_mod.setArchive(self.app.db, job.id, html, text, .done, db_mod.nowUnix());
+        try db_mod.setArchive(self.app.db, url, html, text, .done, db_mod.nowUnix());
+        try self.backfillTitles(url, html);
     }
 
-    const Job = struct { id: i64, url: []u8 };
+    /// Bookmarks saved without a title get one from the archived page.
+    fn backfillTitles(self: *Worker, url: []const u8, html: []const u8) !void {
+        const title = extractTitle(html) orelse return;
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(self.app.gpa);
+        {
+            var q = try self.app.db.prepare("SELECT id FROM bookmark WHERE url=? AND title='';");
+            defer q.finalize();
+            q.bindText(1, url);
+            while (try q.step()) try ids.append(self.app.gpa, q.columnInt(0));
+        }
+        for (ids.items) |id| {
+            try db_mod.updateBookmark(self.app.db, id, .{ .title = title }, db_mod.nowUnix());
+        }
+    }
 
-    fn nextPending(self: *Worker) !?Job {
+    fn nextPending(self: *Worker) !?[]u8 {
         self.app.db_mutex.lockUncancelable(self.app.io);
         defer self.app.db_mutex.unlock(self.app.io);
-        var q = try self.app.db.prepare(
-            "SELECT a.bookmark_id, b.url FROM archive a JOIN bookmark b ON b.id=a.bookmark_id WHERE a.status='pending' LIMIT 1;",
-        );
+        var q = try self.app.db.prepare("SELECT url FROM archive WHERE status='pending' LIMIT 1;");
         defer q.finalize();
         if (!try q.step()) return null;
-        return .{ .id = q.columnInt(0), .url = try self.app.gpa.dupe(u8, q.columnText(1)) };
+        return try self.app.gpa.dupe(u8, q.columnText(0));
     }
 
-    fn markFailed(self: *Worker, id: i64) !void {
+    fn markFailed(self: *Worker, url: []const u8, status: @import("models.zig").ArchiveStatus) !void {
         self.app.db_mutex.lockUncancelable(self.app.io);
         defer self.app.db_mutex.unlock(self.app.io);
-        try db_mod.setArchive(self.app.db, id, "", "", .failed, db_mod.nowUnix());
+        try db_mod.setArchive(self.app.db, url, "", "", status, db_mod.nowUnix());
     }
 
     /// Run the archiver, capture stdout HTML. Caller frees.
@@ -74,6 +87,10 @@ pub const Worker = struct {
         self.app.gpa.free(result.stderr);
         switch (result.term) {
             .exited => |code| {
+                if (code == 3) {
+                    self.app.gpa.free(result.stdout);
+                    return error.DeadLink;
+                }
                 if (code != 0) {
                     self.app.gpa.free(result.stdout);
                     return error.ArchiverFailed;
@@ -87,6 +104,20 @@ pub const Worker = struct {
         return result.stdout;
     }
 };
+
+fn extractTitle(html: []const u8) ?[]const u8 {
+    const start_tag = std.ascii.indexOfIgnoreCase(html, "<title") orelse return null;
+    const open_end = std.mem.indexOfScalarPos(u8, html, start_tag, '>') orelse return null;
+    const close = std.ascii.indexOfIgnoreCasePos(html, open_end, "</title") orelse return null;
+    const t = std.mem.trim(u8, html[open_end + 1 .. close], " \t\r\n");
+    if (t.len == 0) return null;
+    return t;
+}
+
+test "extractTitle" {
+    try std.testing.expectEqualStrings("Hi", extractTitle("<html><TITLE>\n Hi </title>").?);
+    try std.testing.expect(extractTitle("<p>no title</p>") == null);
+}
 
 const testing = std.testing;
 
@@ -108,8 +139,8 @@ test "worker archives a pending bookmark via stub" {
         .base_path = "",
     };
 
-    const id = try db_mod.insertBookmark(&db, .{ .url = "https://w.test", .title = "W" }, 1);
-    try db_mod.setArchive(&db, id, "", "", .pending, 1);
+    _ = try db_mod.insertBookmark(&db, .{ .url = "https://w.test", .title = "W" }, 1, 1);
+    try db_mod.enqueueArchive(&db, "https://w.test");
 
     var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/fake-archiver.sh", .timeout_secs = 0 };
     try w.tick();
@@ -136,17 +167,17 @@ test "worker marks a bookmark failed when archiver exits non-zero" {
         .base_path = "",
     };
 
-    const id = try db_mod.insertBookmark(&db, .{ .url = "https://fail.test", .title = "F" }, 1);
-    try db_mod.setArchive(&db, id, "", "", .pending, 1);
+    _ = try db_mod.insertBookmark(&db, .{ .url = "https://fail.test", .title = "F" }, 1, 1);
+    try db_mod.enqueueArchive(&db, "https://fail.test");
 
     // The fixture writes to stdout then exits 1. tick() must complete without
     // crashing (no double-free) and record the failure.
     var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/fail-archiver.sh", .timeout_secs = 0 };
     try w.tick();
 
-    var q = try db.prepare("SELECT status FROM archive WHERE bookmark_id=?;");
+    var q = try db.prepare("SELECT status FROM archive WHERE url=?;");
     defer q.finalize();
-    q.bindInt(1, id);
+    q.bindText(1, "https://fail.test");
     try testing.expect(try q.step());
     try testing.expectEqualStrings("failed", q.columnText(0));
 

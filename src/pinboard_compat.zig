@@ -13,16 +13,36 @@ pub fn registerRoutes(router: anytype) void {
     router.*.get("/v1/posts/add", postsAdd, .{});
     router.*.post("/v1/posts/add", postsAdd, .{});
     router.*.get("/v1/posts/delete", postsDelete, .{});
+    router.*.get("/v1/user/api_token", userApiToken, .{});
+}
+
+// GET /v1/user/api_token → {"result":"<TOKEN>"} (connectivity test for clients)
+fn userApiToken(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const auth_uid = api.apiUserId(app, req) orelse return api.unauthorized(res);
+    res.header("Access-Control-Allow-Origin", "*");
+    const token = (db_mod.getApiToken(app.db, res.arena, auth_uid) catch |e| {
+        res.status = 500;
+        try res.json(.{ .@"error" = @errorName(e) }, .{});
+        return;
+    }) orelse "";
+    res.status = 200;
+    try res.json(.{ .result = token }, .{});
 }
 
 // GET /v1/posts/update → {"update_time":"<ISO8601>"}
 fn postsUpdate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
+    const auth_uid = api.apiUserId(app, req) orelse return api.unauthorized(res);
+    // Browser clients (HN Legible) call /v1 cross-origin with auth_token in
+    // the query, so a permissive origin header is enough - no preflight.
+    res.header("Access-Control-Allow-Origin", "*");
 
-    var q = try app.db.prepare("SELECT MAX(updated_at) FROM bookmark;");
+    var q = try app.db.prepare("SELECT MAX(updated_at) FROM bookmark WHERE user_id=?;");
     defer q.finalize();
+    q.bindInt(1, auth_uid);
     const has_row = try q.step();
     const unix: i64 = if (has_row) q.columnInt(0) else db_mod.nowUnix();
 
@@ -41,9 +61,13 @@ fn postsAll(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
+    const auth_uid = api.apiUserId(app, req) orelse return api.unauthorized(res);
+    // Browser clients (HN Legible) call /v1 cross-origin with auth_token in
+    // the query, so a permissive origin header is enough - no preflight.
+    res.header("Access-Control-Allow-Origin", "*");
 
     const ids = try db_mod.listBookmarkIds(app.db, res.arena, .{
+        .user_id = auth_uid,
         .tag = tag,
         .limit = 100000,
     });
@@ -127,9 +151,12 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
+    const auth_uid = api.apiUserId(app, req) orelse return api.unauthorized(res);
+    // Browser clients (HN Legible) call /v1 cross-origin with auth_token in
+    // the query, so a permissive origin header is enough - no preflight.
+    res.header("Access-Control-Allow-Origin", "*");
 
-    if (try db_mod.findIdByUrl(app.db, url)) |existing_id| {
+    if (try db_mod.findIdByUrlFor(app.db, url, auth_uid)) |existing_id| {
         // URL exists
         if (std.mem.eql(u8, replace, "no")) {
             res.status = 200;
@@ -153,8 +180,9 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             .toread = toread,
             .shared = shared,
             .tags = tags,
-        }, created_at);
+        }, created_at, auth_uid);
     }
+    db_mod.enqueueArchive(app.db, url) catch {};
 
     res.status = 200;
     try res.json(.{ .result_code = "done" }, .{});
@@ -171,9 +199,12 @@ fn postsDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (api.apiUserId(app, req) == null) return api.unauthorized(res);
+    const auth_uid = api.apiUserId(app, req) orelse return api.unauthorized(res);
+    // Browser clients (HN Legible) call /v1 cross-origin with auth_token in
+    // the query, so a permissive origin header is enough - no preflight.
+    res.header("Access-Control-Allow-Origin", "*");
 
-    if (try db_mod.findIdByUrl(app.db, url)) |id| {
+    if (try db_mod.findIdByUrlFor(app.db, url, auth_uid)) |id| {
         try db_mod.deleteBookmark(app.db, id);
         res.status = 200;
         try res.json(.{ .result_code = "done" }, .{});

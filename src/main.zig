@@ -6,10 +6,11 @@ const archive = @import("archive.zig");
 const auth = @import("auth.zig");
 
 const Args = struct {
-    db: [:0]const u8 = "vinboard.db",
+    db: [:0]const u8 = "~/.local/state/vinboard/vinboard.db",
     port: u16 = 4670,
     base_path: []const u8 = "",
-    archiver: []const u8 = "single-file",
+    archiver: []const u8 = "vinboard-archiver",
+    shortcut_out: []const u8 = "",
     set_password: ?[2][]const u8 = null, // handle, password
 };
 
@@ -23,6 +24,9 @@ const usage =
     \\  --port <port>       listen port (default: 4670)
     \\  --base-path <path>  url prefix emitted in pages, for reverse proxies (default: none)
     \\  --archiver <cmd>    page archiver command, must print html to stdout (default: single-file)
+    \\  --shortcut-out <path>
+    \\                      write the generated ios shortcut here and redirect to
+    \\                      /vinboard.shortcut at the site root (default: serve inline)
     \\  --set-password <handle> <password>
     \\                      set a user's password and exit
     \\  --help              show this help and exit
@@ -42,6 +46,8 @@ fn parseArgs(alloc: std.mem.Allocator, args: std.process.Args) !Args {
             a.base_path = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
         } else if (std.mem.eql(u8, arg, "--archiver")) {
             a.archiver = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
+        } else if (std.mem.eql(u8, arg, "--shortcut-out")) {
+            a.shortcut_out = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
         } else if (std.mem.eql(u8, arg, "--set-password")) {
             const handle = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
             const password = try alloc.dupe(u8, it.next() orelse return error.MissingArgValue);
@@ -79,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
         .db = &db,
         .db_mutex = &mutex,
         .base_path = args.base_path,
+        .shortcut_out = args.shortcut_out,
         .io = init.io,
     };
 

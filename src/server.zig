@@ -7,6 +7,7 @@ pub const App = struct {
     db: *sqlite.Db,
     db_mutex: *std.Io.Mutex,
     base_path: []const u8,
+    shortcut_out: []const u8 = "",
     io: std.Io,
 };
 

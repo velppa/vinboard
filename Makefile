@@ -2,34 +2,30 @@
 ZIG  ?= zig
 DB   ?= $(HOME)/.local/state/vinboard/vinboard.db
 PORT ?= 4670
-# Archives pages through Safari (safaridriver --mcp). Set ARCHIVER=single-file
-# to switch back to the Chromium-based archiver.
-ARCHIVER ?= $(CURDIR)/scripts/safari-archive.js
-# Ensure the spawned archiver (single-file) resolves; it lives on the mise shim path.
-SHIMS = $(HOME)/.local/share/mise/shims
+# Archives pages through Safari (safaridriver --mcp).
 
 export NO_COLOR=1
 
 .PHONY: build test run start-vinboard stop-vinboard install-deps
 
 build:
-	$(ZIG) build --summary none -Doptimize=ReleaseSafe
+	NO_COLOR=1 $(ZIG) build --summary none -Doptimize=ReleaseSafe
+	rm ~/.local/bin/vinboard
+	ln -s $(CURDIR)/zig-out/bin/vinboard ~/.local/bin
 
 test:
 	$(ZIG) build test --summary all
 
-run: build
-	./zig-out/bin/vinboard --db $(DB) --port $(PORT) --base-path /vinboard --archiver $(ARCHIVER)
+run:
+	vinboard --base-path /vinboard
 
-# Run detached under dtach (same pattern as Textpod). PATH carries the mise
-# shims so the archive worker can exec `single-file`.
-start: build
-	mkdir -p $(HOME)/vinboard
-	dtach -n /tmp/vinboard.sock env PATH="$(SHIMS):$$PATH" \
-	  ./zig-out/bin/vinboard --db $(DB) --port $(PORT) --base-path /vinboard --archiver $(ARCHIVER)
+# Run detached under dtach.
+start:
+	dtach -n /tmp/vinboard.sock \
+	  vinboard --base-path /vinboard
 
 stop:
-	-pkill -f 'zig-out/bin/vinboard'
+	-pkill -f 'vinboard'
 
 # Archiver: single-file drives headless Chrome — Chrome/Chromium must be
 # installed separately for archiving to work (the server runs fine without it;

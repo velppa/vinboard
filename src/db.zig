@@ -7,7 +7,7 @@ pub const SCHEMA: [:0]const u8 =
     \\PRAGMA foreign_keys=ON;
     \\CREATE TABLE IF NOT EXISTS bookmark(
     \\  id INTEGER PRIMARY KEY,
-    \\  url TEXT UNIQUE NOT NULL,
+    \\  url TEXT NOT NULL,
     \\  title TEXT NOT NULL DEFAULT '',
     \\  notes TEXT NOT NULL DEFAULT '',
     \\  created_at INTEGER NOT NULL,
@@ -15,7 +15,8 @@ pub const SCHEMA: [:0]const u8 =
     \\  toread INTEGER NOT NULL DEFAULT 0,
     \\  shared INTEGER NOT NULL DEFAULT 0,
     \\  starred INTEGER NOT NULL DEFAULT 0,
-    \\  user_id INTEGER NOT NULL DEFAULT 1
+    \\  user_id INTEGER NOT NULL DEFAULT 1,
+    \\  UNIQUE(url, user_id)
     \\);
     \\CREATE TABLE IF NOT EXISTS user(
     \\  id INTEGER PRIMARY KEY,
@@ -35,7 +36,7 @@ pub const SCHEMA: [:0]const u8 =
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_tags_tag ON tag(tag);
     \\CREATE TABLE IF NOT EXISTS archive(
-    \\  bookmark_id INTEGER PRIMARY KEY REFERENCES bookmark(id) ON DELETE CASCADE,
+    \\  url TEXT PRIMARY KEY,
     \\  html BLOB,
     \\  text TEXT,
     \\  fetched_at INTEGER,
@@ -54,6 +55,7 @@ pub fn migrate(db: *sqlite.Db) !void {
     try renameTable(db, "users", "user");
     try renameTable(db, "sessions", "session");
     try renameTable(db, "bookmarks_fts", "bookmark_fts");
+    try rebuildForPerUserUrls(db);
     try db.exec(SCHEMA);
     // Columns added after the initial schema.
     if (!try hasColumn(db, "bookmark", "starred")) {
@@ -70,6 +72,61 @@ pub fn migrate(db: *sqlite.Db) !void {
     }
     // Seed the owner; login stays disabled until a password is set.
     try db.exec("INSERT OR IGNORE INTO user(id, handle) VALUES (1, 'velppa');");
+}
+
+/// One-off rebuild: bookmark url unique per user, archive keyed by url
+/// (the cached artifact is shared by everyone who saved the url).
+fn rebuildForPerUserUrls(db: *sqlite.Db) !void {
+    if (!try tableExists(db, "bookmark")) return;
+    try db.exec("PRAGMA foreign_keys=OFF;");
+    defer db.exec("PRAGMA foreign_keys=ON;") catch {};
+
+    const bm_sql = try tableSqlContains(db, "bookmark", "UNIQUE(url, user_id)");
+    if (!bm_sql) {
+        try db.exec(
+            \\CREATE TABLE bookmark_new(
+            \\  id INTEGER PRIMARY KEY,
+            \\  url TEXT NOT NULL,
+            \\  title TEXT NOT NULL DEFAULT '',
+            \\  notes TEXT NOT NULL DEFAULT '',
+            \\  created_at INTEGER NOT NULL,
+            \\  updated_at INTEGER NOT NULL,
+            \\  toread INTEGER NOT NULL DEFAULT 0,
+            \\  shared INTEGER NOT NULL DEFAULT 0,
+            \\  starred INTEGER NOT NULL DEFAULT 0,
+            \\  user_id INTEGER NOT NULL DEFAULT 1,
+            \\  UNIQUE(url, user_id)
+            \\);
+            \\INSERT INTO bookmark_new SELECT id,url,title,notes,created_at,updated_at,toread,shared,starred,user_id FROM bookmark;
+            \\DROP TABLE bookmark;
+            \\ALTER TABLE bookmark_new RENAME TO bookmark;
+        );
+    }
+    if (try tableExists(db, "archive") and try hasColumn(db, "archive", "bookmark_id")) {
+        try db.exec(
+            \\CREATE TABLE archive_new(
+            \\  url TEXT PRIMARY KEY,
+            \\  html BLOB,
+            \\  text TEXT,
+            \\  fetched_at INTEGER,
+            \\  status TEXT NOT NULL DEFAULT 'pending'
+            \\);
+            \\INSERT OR IGNORE INTO archive_new
+            \\  SELECT b.url, a.html, a.text, a.fetched_at, a.status FROM archive a
+            \\  JOIN bookmark b ON b.id=a.bookmark_id
+            \\  ORDER BY CASE a.status WHEN 'done' THEN 0 ELSE 1 END;
+            \\DROP TABLE archive;
+            \\ALTER TABLE archive_new RENAME TO archive;
+        );
+    }
+}
+
+fn tableSqlContains(db: *sqlite.Db, table: []const u8, needle: []const u8) !bool {
+    var q = try db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?;");
+    defer q.finalize();
+    q.bindText(1, table);
+    if (!try q.step()) return false;
+    return std.mem.indexOf(u8, q.columnText(0), needle) != null;
 }
 
 fn tableExists(db: *sqlite.Db, name: []const u8) !bool {
@@ -125,10 +182,10 @@ test "migrate creates fts5 table" {
     try testing.expectEqual(@as(i64, 1), q.columnInt(0));
 }
 
-/// Insert a bookmark and its tags. Returns the new id. now = unix seconds.
-pub fn insertBookmark(db: *sqlite.Db, nb: models.NewBookmark, now: i64) !i64 {
+/// Insert a bookmark and its tags for a user. Returns the new id.
+pub fn insertBookmark(db: *sqlite.Db, nb: models.NewBookmark, now: i64, user_id: i64) !i64 {
     var ins = try db.prepare(
-        "INSERT INTO bookmark(url,title,notes,created_at,updated_at,toread,shared) VALUES (?,?,?,?,?,?,?);",
+        "INSERT INTO bookmark(url,title,notes,created_at,updated_at,toread,shared,user_id) VALUES (?,?,?,?,?,?,?,?);",
     );
     defer ins.finalize();
     ins.bindText(1, nb.url);
@@ -138,6 +195,7 @@ pub fn insertBookmark(db: *sqlite.Db, nb: models.NewBookmark, now: i64) !i64 {
     ins.bindInt(5, now);
     ins.bindInt(6, @intFromBool(nb.toread));
     ins.bindInt(7, @intFromBool(nb.shared));
+    ins.bindInt(8, user_id);
     _ = try ins.step();
     const id = sqlite.c.sqlite3_last_insert_rowid(db.handle);
     try replaceTags(db, id, nb.tags);
@@ -159,13 +217,17 @@ fn replaceTags(db: *sqlite.Db, id: i64, tags: []const []const u8) !void {
     }
 }
 
+pub fn reindexBookmark(db: *sqlite.Db, id: i64) !void {
+    return reindex(db, id);
+}
+
 fn reindex(db: *sqlite.Db, id: i64) !void {
     try unindex(db, id);
     var ins = try db.prepare(
         \\INSERT INTO bookmark_fts(rowid,title,notes,url,tags,body)
         \\SELECT b.id, b.title, b.notes, b.url,
         \\  COALESCE((SELECT group_concat(tag,' ') FROM tag WHERE bookmark_id=b.id),''),
-        \\  COALESCE((SELECT text FROM archive WHERE bookmark_id=b.id),'')
+        \\  COALESCE((SELECT text FROM archive WHERE url=b.url),'')
         \\FROM bookmark b WHERE b.id=?;
     );
     defer ins.finalize();
@@ -180,7 +242,7 @@ test "insert and read back a bookmark" {
         .url = "https://x.test",
         .title = "X",
         .tags = &.{ "a", "b" },
-    }, 1000);
+    }, 1000, 1);
     try testing.expect(id > 0);
 
     var q = try db.prepare("SELECT url,title FROM bookmark WHERE id=?;");
@@ -199,7 +261,7 @@ test "insert and read back a bookmark" {
 
 /// Caller owns all returned memory; free with freeBookmark.
 pub fn getBookmark(db: *sqlite.Db, alloc: std.mem.Allocator, id: i64) !?models.Bookmark {
-    var q = try db.prepare("SELECT id,url,title,notes,created_at,updated_at,toread,shared,starred FROM bookmark WHERE id=?;");
+    var q = try db.prepare("SELECT id,url,title,notes,created_at,updated_at,toread,shared,starred,user_id FROM bookmark WHERE id=?;");
     defer q.finalize();
     q.bindInt(1, id);
     if (!try q.step()) return null;
@@ -213,6 +275,7 @@ pub fn getBookmark(db: *sqlite.Db, alloc: std.mem.Allocator, id: i64) !?models.B
         .toread = q.columnInt(6) != 0,
         .shared = q.columnInt(7) != 0,
         .starred = q.columnInt(8) != 0,
+        .user_id = q.columnInt(9),
     };
     bm.tags = try tagsFor(db, alloc, id);
     return bm;
@@ -239,7 +302,7 @@ pub fn freeBookmark(alloc: std.mem.Allocator, bm: models.Bookmark) void {
 test "getBookmark returns struct with tags" {
     var db = try testDb();
     defer db.close();
-    const id = try insertBookmark(&db, .{ .url = "https://y.test", .title = "Y", .tags = &.{ "z", "a" } }, 5);
+    const id = try insertBookmark(&db, .{ .url = "https://y.test", .title = "Y", .tags = &.{ "z", "a" } }, 5, 1);
     const bm = (try getBookmark(&db, testing.allocator, id)).?;
     defer freeBookmark(testing.allocator, bm);
     try testing.expectEqualStrings("https://y.test", bm.url);
@@ -254,6 +317,7 @@ pub const ListFilter = struct {
     starred: ?bool = null,
     untagged: bool = false,
     archived: bool = false,
+    user_id: ?i64 = null,
     limit: i64 = 100,
     offset: i64 = 0,
 };
@@ -269,8 +333,9 @@ pub fn listBookmarkIds(db: *sqlite.Db, alloc: std.mem.Allocator, f: ListFilter) 
     if (f.toread != null) try sql.appendSlice(alloc, " AND b.toread=?2");
     if (f.shared != null) try sql.appendSlice(alloc, " AND b.shared=?3");
     if (f.starred != null) try sql.appendSlice(alloc, " AND b.starred=?6");
+    if (f.user_id != null) try sql.appendSlice(alloc, " AND b.user_id=?7");
     if (f.untagged) try sql.appendSlice(alloc, " AND NOT EXISTS (SELECT 1 FROM tag tu WHERE tu.bookmark_id=b.id)");
-    if (f.archived) try sql.appendSlice(alloc, " AND EXISTS (SELECT 1 FROM archive ar WHERE ar.bookmark_id=b.id AND ar.status='done')");
+    if (f.archived) try sql.appendSlice(alloc, " AND EXISTS (SELECT 1 FROM archive ar WHERE ar.url=b.url AND ar.status='done')");
     try sql.appendSlice(alloc, " ORDER BY b.created_at DESC LIMIT ?4 OFFSET ?5;");
     const sqlz = try alloc.dupeZ(u8, sql.items);
     defer alloc.free(sqlz);
@@ -281,6 +346,7 @@ pub fn listBookmarkIds(db: *sqlite.Db, alloc: std.mem.Allocator, f: ListFilter) 
     if (f.toread) |v| q.bindInt(2, @intFromBool(v));
     if (f.shared) |v| q.bindInt(3, @intFromBool(v));
     if (f.starred) |v| q.bindInt(6, @intFromBool(v));
+    if (f.user_id) |v| q.bindInt(7, v);
     q.bindInt(4, f.limit);
     q.bindInt(5, f.offset);
 
@@ -293,8 +359,8 @@ pub fn listBookmarkIds(db: *sqlite.Db, alloc: std.mem.Allocator, f: ListFilter) 
 test "list filters by tag" {
     var db = try testDb();
     defer db.close();
-    _ = try insertBookmark(&db, .{ .url = "https://1", .tags = &.{"work"} }, 10);
-    _ = try insertBookmark(&db, .{ .url = "https://2", .tags = &.{"home"} }, 20);
+    _ = try insertBookmark(&db, .{ .url = "https://1", .tags = &.{"work"} }, 10, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://2", .tags = &.{"home"} }, 20, 1);
     const ids = try listBookmarkIds(&db, testing.allocator, .{ .tag = "work" });
     defer testing.allocator.free(ids);
     try testing.expectEqual(@as(usize, 1), ids.len);
@@ -311,8 +377,9 @@ pub fn countFiltered(db: *sqlite.Db, alloc: std.mem.Allocator, f: ListFilter) !i
     if (f.toread != null) try sql.appendSlice(alloc, " AND b.toread=?2");
     if (f.shared != null) try sql.appendSlice(alloc, " AND b.shared=?3");
     if (f.starred != null) try sql.appendSlice(alloc, " AND b.starred=?6");
+    if (f.user_id != null) try sql.appendSlice(alloc, " AND b.user_id=?7");
     if (f.untagged) try sql.appendSlice(alloc, " AND NOT EXISTS (SELECT 1 FROM tag tu WHERE tu.bookmark_id=b.id)");
-    if (f.archived) try sql.appendSlice(alloc, " AND EXISTS (SELECT 1 FROM archive ar WHERE ar.bookmark_id=b.id AND ar.status='done')");
+    if (f.archived) try sql.appendSlice(alloc, " AND EXISTS (SELECT 1 FROM archive ar WHERE ar.url=b.url AND ar.status='done')");
     try sql.appendSlice(alloc, ";");
     const sqlz = try alloc.dupeZ(u8, sql.items);
     defer alloc.free(sqlz);
@@ -323,6 +390,7 @@ pub fn countFiltered(db: *sqlite.Db, alloc: std.mem.Allocator, f: ListFilter) !i
     if (f.toread) |v| q.bindInt(2, @intFromBool(v));
     if (f.shared) |v| q.bindInt(3, @intFromBool(v));
     if (f.starred) |v| q.bindInt(6, @intFromBool(v));
+    if (f.user_id) |v| q.bindInt(7, v);
     _ = try q.step();
     return q.columnInt(0);
 }
@@ -330,13 +398,14 @@ pub fn countFiltered(db: *sqlite.Db, alloc: std.mem.Allocator, f: ListFilter) !i
 test "countFiltered by tag" {
     var db = try testDb();
     defer db.close();
-    _ = try insertBookmark(&db, .{ .url = "https://1", .tags = &.{"work"} }, 10);
-    _ = try insertBookmark(&db, .{ .url = "https://2", .tags = &.{"home"} }, 20);
+    _ = try insertBookmark(&db, .{ .url = "https://1", .tags = &.{"work"} }, 10, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://2", .tags = &.{"home"} }, 20, 1);
     try testing.expectEqual(@as(i64, 1), try countFiltered(&db, testing.allocator, .{ .tag = "work" }));
     try testing.expectEqual(@as(i64, 2), try countFiltered(&db, testing.allocator, .{}));
 }
 
 pub const Patch = struct {
+    url: ?[]const u8 = null,
     title: ?[]const u8 = null,
     notes: ?[]const u8 = null,
     toread: ?bool = null,
@@ -346,6 +415,7 @@ pub const Patch = struct {
 };
 
 pub fn updateBookmark(db: *sqlite.Db, id: i64, p: Patch, now: i64) !void {
+    if (p.url) |v| try setText(db, id, "url", v);
     if (p.title) |v| try setText(db, id, "title", v);
     if (p.notes) |v| try setText(db, id, "notes", v);
     if (p.toread) |v| try setInt(db, id, "toread", @intFromBool(v));
@@ -445,6 +515,25 @@ pub fn setApiToken(db: *sqlite.Db, user_id: i64, token: []const u8) !void {
     _ = try q.step();
 }
 
+/// Create a user; returns the new id, or null when the handle is taken.
+pub fn createUser(db: *sqlite.Db, handle: []const u8, hash: []const u8, now: i64) !?i64 {
+    var q = try db.prepare("INSERT OR IGNORE INTO user(handle, password_hash, created_at) VALUES (?,?,?);");
+    defer q.finalize();
+    q.bindText(1, handle);
+    q.bindText(2, hash);
+    q.bindInt(3, now);
+    _ = try q.step();
+    return try (getUserByHandleId(db, handle));
+}
+
+fn getUserByHandleId(db: *sqlite.Db, handle: []const u8) !?i64 {
+    var q = try db.prepare("SELECT id FROM user WHERE handle=? LIMIT 1;");
+    defer q.finalize();
+    q.bindText(1, handle);
+    if (!try q.step()) return null;
+    return q.columnInt(0);
+}
+
 pub fn setUserPassword(db: *sqlite.Db, handle: []const u8, hash: []const u8) !void {
     var q = try db.prepare("UPDATE user SET password_hash=? WHERE handle=?;");
     defer q.finalize();
@@ -481,7 +570,7 @@ pub fn deleteSession(db: *sqlite.Db, token: []const u8) !void {
 
 /// True when a fetched archive copy exists for the bookmark.
 pub fn archiveDone(db: *sqlite.Db, id: i64) !bool {
-    var q = try db.prepare("SELECT 1 FROM archive WHERE bookmark_id=? AND status='done';");
+    var q = try db.prepare("SELECT 1 FROM archive a JOIN bookmark b ON a.url=b.url WHERE b.id=? AND a.status='done';");
     defer q.finalize();
     q.bindInt(1, id);
     return try q.step();
@@ -492,6 +581,16 @@ pub fn findIdByUrl(db: *sqlite.Db, url: []const u8) !?i64 {
     var q = try db.prepare("SELECT id FROM bookmark WHERE url=? LIMIT 1;");
     defer q.finalize();
     q.bindText(1, url);
+    if (!try q.step()) return null;
+    return q.columnInt(0);
+}
+
+/// Like findIdByUrl but only within one user's bookmarks.
+pub fn findIdByUrlFor(db: *sqlite.Db, url: []const u8, user_id: i64) !?i64 {
+    var q = try db.prepare("SELECT id FROM bookmark WHERE url=? AND user_id=? LIMIT 1;");
+    defer q.finalize();
+    q.bindText(1, url);
+    q.bindInt(2, user_id);
     if (!try q.step()) return null;
     return q.columnInt(0);
 }
@@ -514,7 +613,7 @@ fn unindex(db: *sqlite.Db, id: i64) !void {
 test "update then delete" {
     var db = try testDb();
     defer db.close();
-    const id = try insertBookmark(&db, .{ .url = "https://u", .title = "old" }, 1);
+    const id = try insertBookmark(&db, .{ .url = "https://u", .title = "old" }, 1, 1);
     try updateBookmark(&db, id, .{ .title = "new", .toread = true }, 2);
     const bm = (try getBookmark(&db, testing.allocator, id)).?;
     defer freeBookmark(testing.allocator, bm);
@@ -540,8 +639,8 @@ pub fn search(db: *sqlite.Db, alloc: std.mem.Allocator, query: []const u8, limit
 test "search finds by title and tag" {
     var db = try testDb();
     defer db.close();
-    _ = try insertBookmark(&db, .{ .url = "https://zig", .title = "Zig language", .tags = &.{"programming"} }, 1);
-    _ = try insertBookmark(&db, .{ .url = "https://cook", .title = "Cooking", .tags = &.{"food"} }, 2);
+    _ = try insertBookmark(&db, .{ .url = "https://zig", .title = "Zig language", .tags = &.{"programming"} }, 1, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://cook", .title = "Cooking", .tags = &.{"food"} }, 2, 1);
 
     const a = try search(&db, testing.allocator, "zig", 10);
     defer testing.allocator.free(a);
@@ -552,9 +651,13 @@ test "search finds by title and tag" {
     try testing.expectEqual(@as(usize, 1), b.len);
 }
 
-/// Returns a prepared statement that yields (tag, count) rows ordered by count desc.
+/// Returns a prepared statement that yields (tag, count) rows for one user,
+/// ordered by count desc. Finalize after binding user_id to ?1 and stepping.
 pub fn prepareTagCounts(db: *sqlite.Db) !sqlite.Stmt {
-    return db.prepare("SELECT tag, count(*) c FROM tag GROUP BY tag ORDER BY c DESC, tag;");
+    return db.prepare(
+        \\SELECT t.tag, count(*) c FROM tag t JOIN bookmark b ON b.id=t.bookmark_id
+        \\WHERE b.user_id=?1 GROUP BY t.tag ORDER BY c DESC, t.tag;
+    );
 }
 
 /// Returns current Unix time in seconds.
@@ -565,26 +668,44 @@ pub fn nowUnix() i64 {
 }
 
 /// Store archived text + status, then refresh FTS so body becomes searchable.
-pub fn setArchive(db: *sqlite.Db, id: i64, html: []const u8, text: []const u8, status: models.ArchiveStatus, now: i64) !void {
+pub fn setArchive(db: *sqlite.Db, url: []const u8, html: []const u8, text: []const u8, status: models.ArchiveStatus, now: i64) !void {
     var s = try db.prepare(
-        "INSERT INTO archive(bookmark_id,html,text,fetched_at,status) VALUES (?,?,?,?,?) " ++
-        "ON CONFLICT(bookmark_id) DO UPDATE SET html=excluded.html,text=excluded.text,fetched_at=excluded.fetched_at,status=excluded.status;",
+        "INSERT INTO archive(url,html,text,fetched_at,status) VALUES (?,?,?,?,?) " ++
+        "ON CONFLICT(url) DO UPDATE SET html=excluded.html,text=excluded.text,fetched_at=excluded.fetched_at,status=excluded.status;",
     );
     defer s.finalize();
-    s.bindInt(1, id);
+    s.bindText(1, url);
     s.bindText(2, html);
     s.bindText(3, text);
     s.bindInt(4, now);
     s.bindText(5, @tagName(status));
     _ = try s.step();
-    try reindex(db, id);
+    // Everyone bookmarking the url shares the artifact; refresh their fts rows.
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(std.heap.page_allocator);
+    {
+        var q = try db.prepare("SELECT id FROM bookmark WHERE url=?;");
+        defer q.finalize();
+        q.bindText(1, url);
+        while (try q.step()) try ids.append(std.heap.page_allocator, q.columnInt(0));
+    }
+    for (ids.items) |bid| try reindex(db, bid);
+}
+
+/// Queue a url for archiving unless an artifact (or attempt) already exists.
+pub fn enqueueArchive(db: *sqlite.Db, url: []const u8) !void {
+    var s = try db.prepare("INSERT OR IGNORE INTO archive(url) VALUES (?);");
+    defer s.finalize();
+    s.bindText(1, url);
+    _ = try s.step();
 }
 
 test "archived text becomes searchable" {
     var db = try testDb();
     defer db.close();
-    const id = try insertBookmark(&db, .{ .url = "https://p", .title = "Plain" }, 1);
-    try setArchive(&db, id, "<html>x</html>", "elephant zebra", .done, 2);
+    const id = try insertBookmark(&db, .{ .url = "https://p", .title = "Plain" }, 1, 1);
+    _ = id;
+    try setArchive(&db, "https://p", "<html>x</html>", "elephant zebra", .done, 2);
     const hits = try search(&db, testing.allocator, "zebra", 10);
     defer testing.allocator.free(hits);
     try testing.expectEqual(@as(usize, 1), hits.len);

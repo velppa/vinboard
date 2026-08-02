@@ -8,6 +8,7 @@ pub const Bookmark = struct {
     toread: bool,
     shared: bool,
     starred: bool = false,
+    user_id: i64 = 1,
     tags: [][]const u8 = &.{},
 };
 
@@ -20,4 +21,4 @@ pub const NewBookmark = struct {
     tags: []const []const u8 = &.{},
 };
 
-pub const ArchiveStatus = enum { pending, done, failed };
+pub const ArchiveStatus = enum { pending, done, failed, dead };

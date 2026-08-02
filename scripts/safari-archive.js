@@ -9,11 +9,12 @@ import path from "node:path";
 
 const url = process.argv[2];
 if (!url) {
-  console.error("usage: safari-archive <url>");
+  console.error("usage: safari-archive.js <url>");
   process.exit(2);
 }
 
-const DRIVER = process.env.SAFARI_MCP_DRIVER ||
+const DRIVER =
+  process.env.SAFARI_MCP_DRIVER ||
   "/Applications/Safari Technology Preview.app/Contents/MacOS/safaridriver";
 
 // Each safaridriver session launches its own "Safari Technology Preview
@@ -21,9 +22,17 @@ const DRIVER = process.env.SAFARI_MCP_DRIVER ||
 // automation pids so any newcomer can be cleaned up on exit.
 function automationPids() {
   try {
-    return execSync("pgrep -f 'MacOS/Safari Technology Preview -ApplePersistenceIgnoreStateQuietly'", { encoding: "utf8" })
-      .trim().split("\n").filter(Boolean).map(Number);
-  } catch { return []; }
+    return execSync(
+      "pgrep -f 'MacOS/Safari Technology Preview -ApplePersistenceIgnoreStateQuietly'",
+      { encoding: "utf8" },
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map(Number);
+  } catch {
+    return [];
+  }
 }
 const preexisting = new Set(automationPids());
 
@@ -34,7 +43,11 @@ let nextId = 1;
 
 rl.on("line", (line) => {
   let msg;
-  try { msg = JSON.parse(line); } catch { return; }
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
   if (msg.id !== undefined && pending.has(msg.id)) {
     const { resolve, reject } = pending.get(msg.id);
     pending.delete(msg.id);
@@ -47,7 +60,9 @@ function call(method, params) {
   return new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { resolve, reject });
-    p.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    p.stdin.write(
+      JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
+    );
   });
 }
 
@@ -69,6 +84,28 @@ const deadline = setTimeout(() => {
 let exitCode = 1;
 let handle = null;
 try {
+  // Cheap liveness probe before involving Safari: unreachable hosts and
+  // gone pages are dead links (exit 3), not archive failures. Safari itself
+  // happily renders an error page, which would get archived as content.
+  try {
+    const probe = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(20000),
+    });
+    if (probe.status === 404 || probe.status === 410) {
+      exitCode = 3;
+      throw new Error(`dead link: HTTP ${probe.status}`);
+    }
+  } catch (e) {
+    if (exitCode === 3) throw e;
+    if (e.name === "TypeError" || e.cause) {
+      // undici network failure
+      exitCode = 3;
+      throw new Error(`dead link: ${e.cause ? e.cause.message : e.message}`);
+    }
+    // timeouts and odd errors: not proof of death, let Safari try
+  }
+
   await call("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: {},
@@ -76,10 +113,29 @@ try {
   });
   notify("notifications/initialized", {});
 
-  const tab = await call("tools/call", { name: "create_tab", arguments: { url } });
-  try { handle = JSON.parse(toolText(tab)).handle; } catch { /* keep null */ }
+  let tab;
+  try {
+    tab = await call("tools/call", { name: "create_tab", arguments: { url } });
+  } catch (e) {
+    // The page never loaded at all: report a dead link (exit 3).
+    exitCode = 3;
+    throw e;
+  }
+  try {
+    handle = JSON.parse(toolText(tab)).handle;
+  } catch {
+    /* keep null */
+  }
 
-  await call("tools/call", { name: "wait_for_navigation", arguments: { timeout_seconds: 60 } });
+  try {
+    await call("tools/call", {
+      name: "wait_for_navigation",
+      arguments: { timeout_seconds: 60 },
+    });
+  } catch (e) {
+    exitCode = 3;
+    throw e;
+  }
   // Let script-rendered pages settle; load-complete fires before they paint content.
   await new Promise((r) => setTimeout(r, 3000));
 
@@ -101,7 +157,8 @@ try {
   fs.unlinkSync(tmp);
   const html = wrapper.content || "";
   // Near-empty extractions are failed loads, not archives.
-  if (html.length < 50) throw new Error(`extraction too small (${html.length} bytes)`);
+  if (html.length < 50)
+    throw new Error(`extraction too small (${html.length} bytes)`);
   process.stdout.write(html);
   exitCode = 0;
 } catch (e) {
@@ -109,16 +166,28 @@ try {
 } finally {
   clearTimeout(deadline);
   if (handle) {
-    try { await call("tools/call", { name: "close_tab", arguments: { handle } }); } catch { /* closing anyway */ }
+    try {
+      await call("tools/call", { name: "close_tab", arguments: { handle } });
+    } catch {
+      /* closing anyway */
+    }
   }
   // Graceful first: EOF lets safaridriver tear its session down; then kill.
-  try { p.stdin.end(); } catch { /* already gone */ }
+  try {
+    p.stdin.end();
+  } catch {
+    /* already gone */
+  }
   const exited = new Promise((r) => p.once("exit", r));
   await Promise.race([exited, new Promise((r) => setTimeout(r, 3000))]);
   p.kill();
   for (const pid of automationPids()) {
     if (!preexisting.has(pid)) {
-      try { process.kill(pid); } catch { /* already gone */ }
+      try {
+        process.kill(pid);
+      } catch {
+        /* already gone */
+      }
     }
   }
   process.exit(exitCode);

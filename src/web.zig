@@ -28,7 +28,14 @@ pub fn registerRoutes(router: anytype) void {
     router.*.post("/ui/password", passwordSubmit, .{});
     router.*.post("/ui/token", tokenSubmit, .{});
     router.*.post("/ui/fontsize", fontSizeSubmit, .{});
+    router.*.post("/ui/tag/rename", tagRename, .{});
+    router.*.post("/ui/tag/delete", tagDelete, .{});
     router.*.get("/vinboard.shortcut", shortcutDownload, .{});
+    router.*.post("/ui/share/:id", shareToggle, .{});
+    router.*.get("/system", systemPage, .{});
+    router.*.get("/signup", signupPage, .{});
+    router.*.post("/ui/signup", signupSubmit, .{});
+    router.*.get("/static/captcha.png", captchaPng, .{});
     router.*.post("/ui/login", loginSubmit, .{});
     router.*.post("/ui/logout", logoutSubmit, .{});
     router.*.get("/static/style.css", styleCss, .{});
@@ -51,6 +58,7 @@ const css =
     \\#pinboard_name:hover { color:red; }
     \\#top_menu { margin-top:2px; float:right; }
     \\button { -webkit-appearance:none; appearance:none; background:#157efb; color:#fff; border:0; border-radius:14px; padding:4px 16px; font:inherit; font-weight:bold; line-height:1.4; cursor:pointer; }
+    \\a.btn, a.btn:visited { display:inline-block; background:#157efb; color:#fff; border-radius:14px; padding:4px 16px; font-weight:bold; line-height:1.4; margin-right:6px; }
     \\button.linklike { -webkit-appearance:none; appearance:none; background:none; border:0; border-radius:0; padding:0; font:inherit; font-weight:normal; color:#11a; cursor:pointer; }
     \\#main_column { max-width:700px; float:left; width:100%; text-align:left; position:relative; }
     \\#bookmarks { margin-top:1em; margin-left:6px; }
@@ -73,8 +81,9 @@ const css =
     \\a.delete, a.delete:visited { color:#aaa; }
     \\a.delete:hover { color:#44d; }
     \\.archived, .archived:visited { color:#aaa; }
-    \\a.star, a.star:visited { color:#ccc; margin-left:-18px; font-size:1.3em; cursor:pointer; float:left; }
-    \\a.selected_star, a.selected_star:visited { color:#22a; }
+    \\.star { color:#ccc; margin-left:-20px; font-size:1.3em; cursor:pointer; float:left; }
+    \\.star span:hover { color:#22a; }
+    \\.star .selected_star { color:#22a; }
     \\#right_bar input[type=search] { width:300px; margin-bottom:0.6em; padding:3px; border-radius:6px; }
     \\.search_btn { margin-bottom:1em; }
     \\#tag_cloud a.tag { margin-right:6px; }
@@ -101,8 +110,9 @@ const css =
     \\  .faint { color:#777; }
     \\  a.edit, a.edit:visited, a.delete, a.delete:visited, .archived, .archived:visited { color:#777; }
     \\  a.edit:hover, a.delete:hover { color:#7aa2f7; }
-    \\  a.star, a.star:visited { color:#555; }
-    \\  a.selected_star, a.selected_star:visited { color:#7aa2f7; }
+    \\  .star { color:#666; }
+    \\  .star span:hover { color:#7aa2f7; }
+    \\  .star .selected_star { color:#7aa2f7; }
     \\  a.next_prev { color:#999; }
     \\  input, textarea { background:#2a2a2c; color:#ccc; border-color:#444; }
     \\  .edit_form, .edit_form p { color:#999; }
@@ -131,6 +141,16 @@ const tag_js =
     \\<script>
     \\let _tags=null;
     \\function vbTags(){return _tags?Promise.resolve(_tags):fetch('ui/tags').then(r=>r.ok?r.json():[]).then(t=>(_tags=t,t));}
+    \\function vbLocalTimes(root){
+    \\  (root||document).querySelectorAll('.when[data-ts]').forEach(el=>{
+    \\    const d=new Date(parseInt(el.dataset.ts,10)*1000);
+    \\    const p=n=>String(n).padStart(2,'0');
+    \\    el.textContent=d.getFullYear()+'.'+p(d.getMonth()+1)+'.'+p(d.getDate())+'\u00a0\u00a0'+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+    \\    delete el.dataset.ts;
+    \\  });
+    \\}
+    \\document.addEventListener('DOMContentLoaded',()=>vbLocalTimes());
+    \\document.addEventListener('htmx:afterSwap',e=>vbLocalTimes(e.target));
     \\document.addEventListener('input',e=>{
     \\  const el=e.target; if(el.name!=='tags')return;
     \\  vbTags().then(tags=>{
@@ -210,6 +230,7 @@ const Filter = struct {
     shared: ?bool = null,
     untagged: bool = false,
     archived: bool = false,
+    user_id: ?i64 = null,
     offset: i64 = 0,
 };
 
@@ -236,7 +257,7 @@ fn parseFilter(req: *httpz.Request) !Filter {
     return f;
 }
 
-const Settings = struct { font_size: i64 = default_font_size };
+const Settings = struct { font_size: i64 = default_font_size, admin: bool = false };
 
 /// Parsed user settings; defaults on any error. Caller holds the db lock.
 fn loadSettings(app: *App, a: std.mem.Allocator, uid: i64) Settings {
@@ -255,6 +276,13 @@ fn saveSettingInt(app: *App, a: std.mem.Allocator, uid: i64, key: []const u8, va
     try parsed.object.put(a, key, .{ .integer = value });
     const out = try std.json.Stringify.valueAlloc(a, parsed, .{});
     try db_mod.setSettings(app.db, uid, out);
+}
+
+/// A bookmark only when it belongs to the user. Caller holds the db lock.
+fn ownedBookmark(app: *App, a: std.mem.Allocator, id: i64, uid: i64) !?models.Bookmark {
+    const bm = (try db_mod.getBookmark(app.db, a, id)) orelse return null;
+    if (bm.user_id != uid) return null;
+    return bm;
 }
 
 /// Logged-in user id from the vb_session cookie. Caller holds the db lock.
@@ -292,23 +320,20 @@ fn renderDisplay(app: *App, a: std.mem.Allocator, bm: models.Bookmark, editable:
 
     const title = if (bm.title.len > 0) bm.title else bm.url;
     const title_cls: []const u8 = if (bm.toread) " unread" else "";
-    const star_cls: []const u8 = if (bm.starred) " selected_star" else "";
     const esc_url = try esc(a, bm.url);
     try out.appendSlice(a, "<div class=\"display\">");
-    if (editable) {
-        try out.appendSlice(a, try std.fmt.allocPrint(a,
-            \\<a class="star{s}" href="#" title="star" hx-post="{s}/ui/star/{d}" hx-target="closest .bookmark" hx-swap="innerHTML">&#9733;</a>
-        , .{ star_cls, base, bm.id }));
-    }
+    const lock: []const u8 = if (bm.shared)
+        ""
+    else if (editable)
+        try std.fmt.allocPrint(a,
+            \\ <a class="lock" href="#" title="private - click to make public" hx-post="{s}/ui/share/{d}" hx-target="closest .bookmark" hx-swap="innerHTML">&#128274;</a>
+        , .{ base, bm.id })
+    else
+        " <span class=\"lock\" title=\"private\">&#128274;</span>";
     try out.appendSlice(a, try std.fmt.allocPrint(a,
         \\<a class="bookmark_title{s}" href="{s}">{s}</a>{s}
         \\<div><a class="url_link" href="{s}">{s}</a></div>
-    , .{
-        title_cls,                                                                       esc_url,
-        try esc(a, title),
-        @as([]const u8, if (bm.shared) "" else " <span class=\"lock\" title=\"private\">&#128274;</span>"),
-        esc_url,                                                                         esc_url,
-    }));
+    , .{ title_cls, esc_url, try esc(a, title), lock, esc_url, esc_url }));
 
     if (bm.notes.len > 0) {
         try out.appendSlice(a, try std.fmt.allocPrint(a,
@@ -327,8 +352,8 @@ fn renderDisplay(app: *App, a: std.mem.Allocator, bm: models.Bookmark, editable:
         try out.appendSlice(a, "</div>");
     }
     try out.appendSlice(a, try std.fmt.allocPrint(a,
-        \\<div><span class="when">{s}</span>
-    , .{try fmtDateTime(a, bm.created_at)}));
+        \\<div><span class="when" data-ts="{d}">{s}</span>
+    , .{ bm.created_at, try fmtDateTime(a, bm.created_at) }));
     if (editable) {
         try out.appendSlice(a, try std.fmt.allocPrint(a,
             \\ &nbsp;
@@ -350,11 +375,26 @@ fn renderDisplay(app: *App, a: std.mem.Allocator, bm: models.Bookmark, editable:
     return out.toOwnedSlice(a);
 }
 
+/// Star column + display: the innerHTML of div.bookmark (htmx swap target).
+fn renderInner(app: *App, a: std.mem.Allocator, bm: models.Bookmark, editable: bool) ![]u8 {
+    const star: []const u8 = if (editable) try std.fmt.allocPrint(a,
+        \\<div class="star"><span class="{s}" title="{s}" hx-post="{s}/ui/star/{d}" hx-target="closest .bookmark" hx-swap="innerHTML" style="cursor:pointer">&#10029;</span></div>
+    , .{
+        @as([]const u8, if (bm.starred) "selected_star" else ""),
+        @as([]const u8, if (bm.starred) "unstar" else "star"),
+        app.base_path,
+        bm.id,
+    }) else "";
+    return std.fmt.allocPrint(a,
+        \\{s}{s}<div style="clear:both"></div>
+    , .{ star, try renderDisplay(app, a, bm, editable) });
+}
+
 fn renderItem(app: *App, a: std.mem.Allocator, bm: models.Bookmark, editable: bool) ![]u8 {
     const cls: []const u8 = if (bm.shared) "bookmark" else "bookmark private";
     return std.fmt.allocPrint(a,
         \\<div class="{s}" id="bm-{d}">{s}</div>
-    , .{ cls, bm.id, try renderDisplay(app, a, bm, editable) });
+    , .{ cls, bm.id, try renderInner(app, a, bm, editable) });
 }
 
 /// Bookmark list + earlier/later nav. Caller holds the db lock.
@@ -390,6 +430,10 @@ fn renderList(app: *App, a: std.mem.Allocator, f: Filter, public_only: bool) ![]
         for (ids) |id| {
             const bm = (try db_mod.getBookmark(app.db, a, id)) orelse continue;
             if (public_only and !bm.shared) continue;
+            // FTS results are unscoped; enforce the owner filter here too.
+            if (f.user_id) |u| {
+                if (bm.user_id != u) continue;
+            }
             try out.appendSlice(a, try renderItem(app, a, bm, !public_only));
         }
     }
@@ -414,18 +458,20 @@ fn renderList(app: *App, a: std.mem.Allocator, f: Filter, public_only: bool) ![]
     return out.toOwnedSlice(a);
 }
 
-/// Tags co-occurring with `tag`, most frequent first. Caller holds the db lock.
-fn renderRelatedTags(app: *App, a: std.mem.Allocator, tag: []const u8) ![]u8 {
+/// Tags co-occurring with `tag` on one user's bookmarks. Caller holds the db lock.
+fn renderRelatedTags(app: *App, a: std.mem.Allocator, tag: []const u8, user_id: i64) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     var st = try app.db.prepare(
         \\SELECT t2.tag, count(*) c FROM tag t1
         \\JOIN tag t2 ON t2.bookmark_id=t1.bookmark_id
-        \\WHERE t1.tag=?1 AND t2.tag<>?1
+        \\JOIN bookmark b ON b.id=t1.bookmark_id
+        \\WHERE t1.tag=?1 AND t2.tag<>?1 AND b.user_id=?2
         \\GROUP BY t2.tag ORDER BY c DESC, t2.tag LIMIT 100;
     );
     defer st.finalize();
     st.bindText(1, tag);
+    st.bindInt(2, user_id);
     try out.appendSlice(a, "<p><b>related tags</b></p><div id=\"tag_cloud\">");
     var n: usize = 0;
     while (try st.step()) : (n += 1) {
@@ -440,13 +486,17 @@ fn renderRelatedTags(app: *App, a: std.mem.Allocator, tag: []const u8) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
-/// Caller holds the db lock.
-fn renderTagCloud(app: *App, a: std.mem.Allocator) ![]u8 {
+/// One user's tag cloud. Caller holds the db lock.
+fn renderTagCloud(app: *App, a: std.mem.Allocator, user_id: i64) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     // Alphabetical like Pinboard's cloud (the API keeps count-ordered tags).
-    var st = try app.db.prepare("SELECT tag, count(*) FROM tag GROUP BY tag ORDER BY tag COLLATE NOCASE;");
+    var st = try app.db.prepare(
+        \\SELECT t.tag, count(*) FROM tag t JOIN bookmark b ON b.id=t.bookmark_id
+        \\WHERE b.user_id=?1 GROUP BY t.tag ORDER BY t.tag COLLATE NOCASE;
+    );
     defer st.finalize();
+    st.bindInt(1, user_id);
     try out.appendSlice(a, "<div id=\"tag_cloud\">");
     while (try st.step()) {
         const tag = try a.dupe(u8, st.columnText(0));
@@ -526,7 +576,7 @@ fn renderFilterBar(a: std.mem.Allocator, base: []const u8, handle: []const u8, f
 }
 
 /// filter_bar may be empty (no bar).
-fn pageShell(a: std.mem.Allocator, base: []const u8, main_html: []const u8, right_html: []const u8, search_q: []const u8, filter_bar: []const u8, logged_in: bool, show_search: bool, font_size: i64) ![]u8 {
+fn pageShell(a: std.mem.Allocator, base: []const u8, main_html: []const u8, right_html: []const u8, search_q: []const u8, filter_bar: []const u8, logged_in: bool, show_search: bool, st: Settings) ![]u8 {
 
     const search_form = if (show_search) try std.fmt.allocPrint(a,
         \\<form action="{s}/" method="get"><input type="search" name="q" placeholder="" value="{s}"
@@ -534,11 +584,15 @@ fn pageShell(a: std.mem.Allocator, base: []const u8, main_html: []const u8, righ
         \\<br><button class="search_btn" type="submit">search</button></form>
     , .{ base, search_q, base }) else "";
 
+    const sys_link: []const u8 = if (st.admin) try std.fmt.allocPrint(a,
+        \\<a href="{s}/system">system</a> &#8231;
+    , .{base}) else "";
     const menu = if (logged_in) try std.fmt.allocPrint(a,
+        \\{s}
         \\<a href="{s}/add">add url</a> &#8231;
         \\<a href="{s}/setup">setup</a> &#8231;
         \\<form style="display:inline" method="post" action="{s}/ui/logout"><button class="linklike" type="submit">log out</button></form>
-    , .{ base, base, base }) else try std.fmt.allocPrint(a,
+    , .{ sys_link, base, base, base }) else try std.fmt.allocPrint(a,
         \\<a href="{s}/login">log in</a>
     , .{base});
 
@@ -568,7 +622,7 @@ fn pageShell(a: std.mem.Allocator, base: []const u8, main_html: []const u8, righ
         \\{s}
         \\</body>
         \\</html>
-    , .{ base, font_size, pin_svg, base, menu, filter_bar, main_html, search_form, right_html, tag_js });
+    , .{ base, st.font_size, pin_svg, base, menu, filter_bar, main_html, search_form, right_html, tag_js });
 }
 
 pub fn index(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -580,15 +634,27 @@ pub fn index(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     const uid = sessionUserId(app, req);
     const logged_in = uid != null;
-    const font = if (uid) |u| loadSettings(app, a, u).font_size else default_font_size;
-    if (!logged_in) f.shared = true; // public bookmarks only
+    const st = if (uid) |u| loadSettings(app, a, u) else Settings{};
+    if (logged_in) f.user_id = uid.? else f.shared = true; // own view vs public-only
 
     const list_html = renderList(app, a, f, !logged_in) catch |e| return serverError(res, e);
     // Tag cloud reveals private data; logged-out gets the list only.
-    const cloud = if (!logged_in) "" else if (f.tag) |t|
-        renderRelatedTags(app, a, t) catch |e| return serverError(res, e)
-    else
-        renderTagCloud(app, a) catch |e| return serverError(res, e);
+    const cloud = if (!logged_in) "" else if (f.tag) |t| blk: {
+        const related = renderRelatedTags(app, a, t, uid.?) catch |e| return serverError(res, e);
+        break :blk try std.fmt.allocPrint(a,
+            \\{s}
+            \\<p style="margin-top:1em"><b>rename tag</b></p>
+            \\<form method="post" action="{s}/ui/tag/rename">
+            \\<input type="hidden" name="from" value="{s}">
+            \\<input type="text" name="to" value="{s}" required>
+            \\<button type="submit">rename</button>
+            \\</form>
+            \\<form method="post" action="{s}/ui/tag/delete" onsubmit="return confirm('"'"'Remove this tag from all bookmarks?'"'"')" style="margin-top:6px">
+            \\<input type="hidden" name="from" value="{s}">
+            \\<button type="submit">delete tag</button>
+            \\</form>
+        , .{ related, app.base_path, try esc(a, t), try esc(a, t), app.base_path, try esc(a, t) });
+    } else renderTagCloud(app, a, uid.?) catch |e| return serverError(res, e);
     const bar = if (logged_in) blk: {
         const handle = (db_mod.getUserHandle(app.db, a, uid.?) catch |e| return serverError(res, e)) orelse "?";
         const total = db_mod.countFiltered(app.db, a, listFilterOf(f)) catch |e| return serverError(res, e);
@@ -597,7 +663,14 @@ pub fn index(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     const search_q = if (f.q) |q| try esc(a, q) else "";
     res.content_type = httpz.ContentType.HTML;
-    res.body = try pageShell(a, app.base_path, list_html, cloud, search_q, bar, logged_in, true, font);
+    res.body = try pageShell(a, app.base_path, list_html, cloud, search_q, bar, logged_in, true, st);
+}
+
+fn listFilterWithPage(f: Filter) db_mod.ListFilter {
+    var lf = listFilterOf(f);
+    lf.limit = page_size;
+    lf.offset = f.offset;
+    return lf;
 }
 
 /// db-layer filter matching what renderList queries.
@@ -609,6 +682,7 @@ fn listFilterOf(f: Filter) db_mod.ListFilter {
         .shared = f.shared,
         .untagged = f.untagged,
         .archived = f.archived,
+        .user_id = f.user_id,
     };
 }
 
@@ -627,30 +701,31 @@ fn fallbackRoute(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     const user = (db_mod.getUserByHandle(app.db, a, handle) catch |e| return serverError(res, e)) orelse return notFound(res);
     const uid = sessionUserId(app, req);
-    const font = if (uid) |u| loadSettings(app, a, u).font_size else default_font_size;
+    const st = if (uid) |u| loadSettings(app, a, u) else Settings{};
     const own = uid != null and uid.? == user.id;
+    f.user_id = user.id;
     if (!own) f.shared = true;
 
     const list_html = renderList(app, a, f, !own) catch |e| return serverError(res, e);
     const cloud = if (!own) "" else if (f.tag) |t|
-        renderRelatedTags(app, a, t) catch |e| return serverError(res, e)
+        renderRelatedTags(app, a, t, user.id) catch |e| return serverError(res, e)
     else
-        renderTagCloud(app, a) catch |e| return serverError(res, e);
+        renderTagCloud(app, a, user.id) catch |e| return serverError(res, e);
     const total = db_mod.countFiltered(app.db, a, listFilterOf(f)) catch |e| return serverError(res, e);
     const bar = try renderFilterBar(a, app.base_path, user.handle, f, total, own);
 
     const search_q = if (f.q) |q| try esc(a, q) else "";
     res.content_type = httpz.ContentType.HTML;
-    res.body = try pageShell(a, app.base_path, list_html, cloud, search_q, bar, uid != null, true, font);
+    res.body = try pageShell(a, app.base_path, list_html, cloud, search_q, bar, uid != null, true, st);
 }
 
 pub fn listFragment(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var f = try parseFilter(req);
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    const logged_in = sessionUserId(app, req) != null;
-    if (!logged_in) f.shared = true;
-    const body = renderList(app, res.arena, f, !logged_in) catch |e| return serverError(res, e);
+    const frag_uid = sessionUserId(app, req);
+    if (frag_uid) |u| f.user_id = u else f.shared = true;
+    const body = renderList(app, res.arena, f, frag_uid == null) catch |e| return serverError(res, e);
     res.content_type = httpz.ContentType.HTML;
     res.body = body;
 }
@@ -659,10 +734,10 @@ pub fn itemFragment(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     const id = idParam(req) orelse return badRequest(res);
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
-    const bm = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return serverError(res, e)) orelse return notFound(res);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    const bm = (ownedBookmark(app, res.arena, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
     res.content_type = httpz.ContentType.HTML;
-    res.body = try renderDisplay(app, res.arena, bm, true);
+    res.body = try renderInner(app, res.arena, bm, true);
 }
 
 pub fn editForm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -670,8 +745,8 @@ pub fn editForm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res);
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
-    const bm = (db_mod.getBookmark(app.db, a, id) catch |e| return serverError(res, e)) orelse return notFound(res);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    const bm = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
 
     var tags_str: std.ArrayList(u8) = .empty;
     for (bm.tags, 0..) |t, i| {
@@ -682,7 +757,7 @@ pub fn editForm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = httpz.ContentType.HTML;
     res.body = try std.fmt.allocPrint(a,
         \\<form class="edit_form" hx-post="{s}/ui/edit/{d}" hx-target="closest .bookmark" hx-swap="innerHTML">
-        \\<p><span class="faint">{s}</span></p>
+        \\<p>url<br><input type="text" name="url" value="{s}"></p>
         \\<p>title<br><input type="text" name="title" value="{s}"></p>
         \\<p>description<br><textarea name="notes" rows="3">{s}</textarea></p>
         \\<p>tags<br><input type="text" name="tags" value="{s}"></p>
@@ -719,8 +794,11 @@ pub fn editSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    _ = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
+    const new_url = fd.get("url") orelse "";
     db_mod.updateBookmark(app.db, id, .{
+        .url = if (new_url.len > 0) new_url else null,
         .title = fd.get("title") orelse "",
         .notes = fd.get("notes") orelse "",
         .tags = try splitTags(a, fd.get("tags") orelse ""),
@@ -730,7 +808,7 @@ pub fn editSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     const bm = (db_mod.getBookmark(app.db, a, id) catch |e| return serverError(res, e)) orelse return notFound(res);
     res.content_type = httpz.ContentType.HTML;
-    res.body = try renderDisplay(app, a, bm, true);
+    res.body = try renderInner(app, a, bm, true);
 }
 
 pub fn starToggle(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -738,12 +816,12 @@ pub fn starToggle(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res);
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
-    const bm = (db_mod.getBookmark(app.db, a, id) catch |e| return serverError(res, e)) orelse return notFound(res);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    const bm = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
     db_mod.updateBookmark(app.db, id, .{ .starred = !bm.starred }, db_mod.nowUnix()) catch |e| return serverError(res, e);
     const updated = (db_mod.getBookmark(app.db, a, id) catch |e| return serverError(res, e)) orelse return notFound(res);
     res.content_type = httpz.ContentType.HTML;
-    res.body = try renderDisplay(app, a, updated, true);
+    res.body = try renderInner(app, a, updated, true);
 }
 
 pub fn markRead(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -751,18 +829,20 @@ pub fn markRead(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res);
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    _ = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
     db_mod.updateBookmark(app.db, id, .{ .toread = false }, db_mod.nowUnix()) catch |e| return serverError(res, e);
     const bm = (db_mod.getBookmark(app.db, a, id) catch |e| return serverError(res, e)) orelse return notFound(res);
     res.content_type = httpz.ContentType.HTML;
-    res.body = try renderDisplay(app, a, bm, true);
+    res.body = try renderInner(app, a, bm, true);
 }
 
 pub fn deleteSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res);
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    _ = (ownedBookmark(app, res.arena, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
     db_mod.deleteBookmark(app.db, id) catch |e| return serverError(res, e);
     res.status = 200;
     res.body = "";
@@ -770,12 +850,12 @@ pub fn deleteSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
 
 pub fn addPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
-    var font: i64 = default_font_size;
+    var st = Settings{};
     {
         app.db_mutex.lockUncancelable(app.io);
         defer app.db_mutex.unlock(app.io);
         const maybe_uid = sessionUserId(app, req);
-        if (maybe_uid) |u| font = loadSettings(app, a, u).font_size;
+        if (maybe_uid) |u| st = loadSettings(app, a, u);
         if (maybe_uid == null) {
             // Bookmarklet popup lands here logged-out; bounce through the
             // login page and come back with the query intact.
@@ -820,9 +900,9 @@ pub fn addPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             \\<title>add to vinboard</title>
             \\<link rel="stylesheet" href="{s}/static/style.css"></head>
             \\<body style="font-size:{d}px"><div id="content">{s}</div>{s}</body></html>
-        , .{ app.base_path, font, form, tag_js });
+        , .{ app.base_path, st.font_size, form, tag_js });
     } else {
-        res.body = try pageShell(a, app.base_path, form, "", "", "", true, false, font);
+        res.body = try pageShell(a, app.base_path, form, "", "", "", true, false, st);
     }
 }
 
@@ -841,10 +921,10 @@ pub fn addSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
     const now = db_mod.nowUnix();
     // Re-adding an existing url updates it, matching Pinboard.
-    if (db_mod.findIdByUrl(app.db, url) catch |e| return serverError(res, e)) |id| {
+    if (db_mod.findIdByUrlFor(app.db, url, owner_uid) catch |e| return serverError(res, e)) |id| {
         db_mod.updateBookmark(app.db, id, patch, now) catch |e| return serverError(res, e);
     } else {
         const id = db_mod.insertBookmark(app.db, .{
@@ -854,8 +934,9 @@ pub fn addSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             .tags = patch.tags.?,
             .shared = patch.shared.?,
             .toread = patch.toread.?,
-        }, now) catch |e| return serverError(res, e);
-        db_mod.setArchive(app.db, id, "", "", .pending, now) catch {};
+        }, now, owner_uid) catch |e| return serverError(res, e);
+        _ = id;
+        db_mod.enqueueArchive(app.db, url) catch {};
     }
 
     if (fd.get("popup")) |p| {
@@ -877,10 +958,10 @@ pub fn setupPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         break :blk sessionUserId(app, req);
     };
     const logged_in = session_uid != null;
-    const font = blk: {
+    const st = blk: {
         app.db_mutex.lockUncancelable(app.io);
         defer app.db_mutex.unlock(app.io);
-        break :blk if (session_uid) |u| loadSettings(app, a, u).font_size else default_font_size;
+        break :blk if (session_uid) |u| loadSettings(app, a, u) else Settings{};
     };
     const qs = try req.query();
     const pw_notice: []const u8 = if (qs.get("pwok") != null) "<p><b>password changed.</b></p>" else "";
@@ -935,7 +1016,25 @@ pub fn setupPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         \\<script>function fsStep(d){{const i=document.getElementById('fs_input');
         \\i.value=Math.min(24,Math.max(11,(parseInt(i.value)||15)+d));
         \\document.body.style.fontSize=i.value+'px';}}</script>
-    , .{ app.base_path, font }) else "";
+    , .{ app.base_path, st.font_size }) else "";
+
+    const hn_section: []const u8 = if (session_uid) |uid| blk: {
+        app.db_mutex.lockUncancelable(app.io);
+        defer app.db_mutex.unlock(app.io);
+        const handle = (db_mod.getUserHandle(app.db, a, uid) catch |e| return serverError(res, e)) orelse "?";
+        const token = (db_mod.getApiToken(app.db, a, uid) catch |e| return serverError(res, e)) orelse "";
+        if (token.len == 0) break :blk "";
+        const enc_handle = try urlEncode(a, handle);
+        const enc_token = try urlEncode(a, token);
+        break :blk try std.fmt.allocPrint(a,
+            \\<h2>HN Legible</h2>
+            \\<p class="faint">Configures the <a href="https://hn.ptpf29qr6x.workers.dev" target="_blank">HN Legible frontend</a> to sync favorites into vinboard.</p>
+            \\<p>
+            \\<a class="btn" href="https://hn.ptpf29qr6x.workers.dev/setup?token={s}%3A{s}&amp;host=vinboard" target="_blank">setup HN Legible (workers)</a>
+            \\<a class="btn" href="https://hotter.myaddr.dev/hn/#setup?token={s}%3A{s}&amp;workers=cors.ptpf29qr6x.workers.dev&amp;host=vinboard" target="_blank">setup HN Legible (js)</a>
+            \\</p>
+        , .{ enc_handle, enc_token, enc_handle, enc_token });
+    } else "";
 
     const shortcut_section: []const u8 = if (logged_in) try std.fmt.allocPrint(a,
         \\<h2>shortcut</h2>
@@ -953,10 +1052,11 @@ pub fn setupPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         \\{s}
         \\{s}
         \\{s}
-    , .{ try esc(a, bookmarklet), shortcut_section, display_section, token_section, pw_form });
+        \\{s}
+    , .{ try esc(a, bookmarklet), shortcut_section, hn_section, display_section, token_section, pw_form });
 
     res.content_type = httpz.ContentType.HTML;
-    res.body = try pageShell(a, app.base_path, main_html, "", "", "", logged_in, false, font);
+    res.body = try pageShell(a, app.base_path, main_html, "", "", "", logged_in, false, st);
 }
 
 pub fn passwordSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -1002,8 +1102,12 @@ pub fn shortcutDownload(app: *App, req: *httpz.Request, res: *httpz.Response) !v
         }
         cred = try std.fmt.allocPrint(a, "{s}:{s}", .{ handle, token });
     }
+    const argv: []const []const u8 = if (app.shortcut_out.len > 0)
+        &.{ "scripts/make-shortcut.sh", cred, app.shortcut_out }
+    else
+        &.{ "scripts/make-shortcut.sh", cred };
     const result = std.process.run(app.gpa, app.io, .{
-        .argv = &.{ "scripts/make-shortcut.sh", cred },
+        .argv = argv,
         .stdout_limit = .limited(4 * 1024 * 1024),
         .stderr_limit = .limited(4096),
     }) catch |e| return serverError(res, e);
@@ -1013,10 +1117,16 @@ pub fn shortcutDownload(app: *App, req: *httpz.Request, res: *httpz.Response) !v
         .exited => |code| code != 0,
         else => true,
     };
-    if (failed or result.stdout.len == 0) return serverError(res, error.ShortcutSignFailed);
-    // Served inline from a .shortcut url with NO content-type, exactly like
-    // caddy's file_server did: iOS Safari then resolves the type from the
-    // extension and offers "Open in Shortcuts" instead of downloading.
+    if (failed) return serverError(res, error.ShortcutSignFailed);
+    if (app.shortcut_out.len > 0) {
+        // Freshly written for the static server; a redirect there serves it
+        // with no Content-Type at all, which is what makes iOS Safari offer
+        // "Open in Shortcuts" instead of downloading.
+        res.status = 302;
+        res.header("Location", "/vinboard.shortcut");
+        return;
+    }
+    if (result.stdout.len == 0) return serverError(res, error.ShortcutSignFailed);
     res.status = 200;
     res.body = try a.dupe(u8, result.stdout);
 }
@@ -1031,6 +1141,93 @@ pub fn tokenSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     db_mod.setApiToken(app.db, uid, token) catch |e| return serverError(res, e);
     res.status = 302;
     res.header("Location", try std.fmt.allocPrint(a, "{s}/setup", .{app.base_path}));
+}
+
+/// Rename a tag across the user's bookmarks; merges into an existing tag.
+fn countArchive(app: *App, status: []const u8) !i64 {
+    var q = try app.db.prepare("SELECT count(*) FROM archive WHERE status=?;");
+    defer q.finalize();
+    q.bindText(1, status);
+    _ = try q.step();
+    return q.columnInt(0);
+}
+
+pub fn tagRename(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const fd = try req.formData();
+    const from = std.mem.trim(u8, fd.get("from") orelse return badRequest(res), " ");
+    const to = std.mem.trim(u8, fd.get("to") orelse return badRequest(res), " ");
+    if (from.len == 0 or to.len == 0 or std.mem.indexOfScalar(u8, to, ' ') != null) return badRequest(res);
+
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const uid = sessionUserId(app, req) orelse return loginRequired(res);
+
+    if (!std.mem.eql(u8, from, to)) {
+        var ids: std.ArrayList(i64) = .empty;
+        {
+            var q = app.db.prepare(
+                \\SELECT t.bookmark_id FROM tag t JOIN bookmark b ON b.id=t.bookmark_id
+                \\WHERE t.tag=?1 AND b.user_id=?2;
+            ) catch |e| return serverError(res, e);
+            defer q.finalize();
+            q.bindText(1, from);
+            q.bindInt(2, uid);
+            while (q.step() catch |e| return serverError(res, e)) try ids.append(a, q.columnInt(0));
+        }
+        for (ids.items) |bid| {
+            var ins = app.db.prepare("INSERT OR IGNORE INTO tag(bookmark_id,tag) VALUES (?,?);") catch |e| return serverError(res, e);
+            ins.bindInt(1, bid);
+            ins.bindText(2, to);
+            _ = ins.step() catch |e| return serverError(res, e);
+            ins.finalize();
+            var del = app.db.prepare("DELETE FROM tag WHERE bookmark_id=? AND tag=?;") catch |e| return serverError(res, e);
+            del.bindInt(1, bid);
+            del.bindText(2, from);
+            _ = del.step() catch |e| return serverError(res, e);
+            del.finalize();
+        }
+        // Tags live in the fts index too.
+        for (ids.items) |bid| db_mod.reindexBookmark(app.db, bid) catch |e| return serverError(res, e);
+    }
+
+    res.status = 302;
+    res.header("Location", try std.fmt.allocPrint(a, "{s}/?tag={s}", .{ app.base_path, try urlEncode(a, to) }));
+}
+
+/// Remove a tag from all of the user's bookmarks.
+pub fn tagDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const fd = try req.formData();
+    const from = std.mem.trim(u8, fd.get("from") orelse return badRequest(res), " ");
+    if (from.len == 0) return badRequest(res);
+
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const uid = sessionUserId(app, req) orelse return loginRequired(res);
+
+    var ids: std.ArrayList(i64) = .empty;
+    {
+        var q = app.db.prepare(
+            \\SELECT t.bookmark_id FROM tag t JOIN bookmark b ON b.id=t.bookmark_id
+            \\WHERE t.tag=?1 AND b.user_id=?2;
+        ) catch |e| return serverError(res, e);
+        defer q.finalize();
+        q.bindText(1, from);
+        q.bindInt(2, uid);
+        while (q.step() catch |e| return serverError(res, e)) try ids.append(a, q.columnInt(0));
+    }
+    for (ids.items) |bid| {
+        var del = app.db.prepare("DELETE FROM tag WHERE bookmark_id=? AND tag=?;") catch |e| return serverError(res, e);
+        del.bindInt(1, bid);
+        del.bindText(2, from);
+        _ = del.step() catch |e| return serverError(res, e);
+        del.finalize();
+        db_mod.reindexBookmark(app.db, bid) catch |e| return serverError(res, e);
+    }
+
+    res.status = 302;
+    res.header("Location", try std.fmt.allocPrint(a, "{s}/", .{app.base_path}));
 }
 
 pub fn fontSizeSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -1058,9 +1255,13 @@ pub fn tagsJson(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (sessionUserId(app, req) == null) return loginRequired(res);
-    var st = app.db.prepare("SELECT DISTINCT tag FROM tag ORDER BY tag COLLATE NOCASE;") catch |e| return serverError(res, e);
+    const tags_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    var st = app.db.prepare(
+        \\SELECT DISTINCT t.tag FROM tag t JOIN bookmark b ON b.id=t.bookmark_id
+        \\WHERE b.user_id=?1 ORDER BY t.tag COLLATE NOCASE;
+    ) catch |e| return serverError(res, e);
     defer st.finalize();
+    st.bindInt(1, tags_uid);
     var arr: std.ArrayList([]const u8) = .empty;
     while (st.step() catch |e| return serverError(res, e)) {
         try arr.append(a, try a.dupe(u8, st.columnText(0)));
@@ -1086,9 +1287,10 @@ pub fn loginPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         \\<p>password<br><input type="password" name="password" required></p>
         \\<p><button class="search_btn" type="submit">log in</button></p>
         \\</form>
-    , .{ app.base_path, try esc(a, next) });
+        \\<p class="faint">no account? <a href="{s}/signup">sign up</a></p>
+    , .{ app.base_path, try esc(a, next), app.base_path });
     res.content_type = httpz.ContentType.HTML;
-    res.body = try pageShell(a, app.base_path, form, "", "", "", false, false, default_font_size);
+    res.body = try pageShell(a, app.base_path, form, "", "", "", false, false, .{});
 }
 
 pub fn loginSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -1138,6 +1340,147 @@ pub fn logoutSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     res.header("Set-Cookie", try std.fmt.allocPrint(a, "vb_session=; Path={s}; HttpOnly; SameSite=Lax; Max-Age=0", .{cookie_path}));
     res.status = 302;
     res.header("Location", try std.fmt.allocPrint(a, "{s}/", .{app.base_path}));
+}
+
+/// Make a private bookmark public (click on the lock).
+pub fn shareToggle(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const id = idParam(req) orelse return badRequest(res);
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    _ = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
+    db_mod.updateBookmark(app.db, id, .{ .shared = true }, db_mod.nowUnix()) catch |e| return serverError(res, e);
+    const bm = (db_mod.getBookmark(app.db, a, id) catch |e| return serverError(res, e)) orelse return notFound(res);
+    res.content_type = httpz.ContentType.HTML;
+    res.body = try renderInner(app, a, bm, true);
+}
+
+/// Admin-only overview: users, archive queue, db size, bookmark count.
+pub fn systemPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const uid = sessionUserId(app, req) orelse return loginRequired(res);
+    const st = loadSettings(app, a, uid);
+    if (!st.admin) return notFound(res);
+
+    var users_html: std.ArrayList(u8) = .empty;
+    var n_users: i64 = 0;
+    {
+        var q = app.db.prepare("SELECT handle FROM user ORDER BY handle;") catch |e| return serverError(res, e);
+        defer q.finalize();
+        while (q.step() catch |e| return serverError(res, e)) : (n_users += 1) {
+            const h = try a.dupe(u8, q.columnText(0));
+            try users_html.appendSlice(a, try std.fmt.allocPrint(a,
+                \\<a href="{s}/u:{s}">{s}</a>
+            , .{ app.base_path, try urlEncode(a, h), try esc(a, h) }));
+            try users_html.append(a, ' ');
+        }
+    }
+    const pending = countArchive(app, "pending") catch |e| return serverError(res, e);
+    const dead = countArchive(app, "dead") catch |e| return serverError(res, e);
+    const n_bookmarks = db_mod.countFiltered(app.db, a, .{}) catch |e| return serverError(res, e);
+    const db_bytes = blk: {
+        var q = app.db.prepare("SELECT (SELECT * FROM pragma_page_count())*(SELECT * FROM pragma_page_size());") catch |e| return serverError(res, e);
+        defer q.finalize();
+        _ = q.step() catch |e| return serverError(res, e);
+        break :blk q.columnInt(0);
+    };
+
+    const main_html = try std.fmt.allocPrint(a,
+        \\<h1>system</h1>
+        \\<p><b>{d}</b> users: {s}</p>
+        \\<p><b>{d}</b> bookmarks</p>
+        \\<p><b>{d}</b> items in the archiving queue</p>
+        \\<p><b>{d}</b> dead links</p>
+        \\<p>db size <b>{d:.1}</b> MB</p>
+    , .{ n_users, users_html.items, n_bookmarks, pending, dead, @as(f64, @floatFromInt(db_bytes)) / (1024.0 * 1024.0) });
+
+    res.content_type = httpz.ContentType.HTML;
+    res.body = try pageShell(a, app.base_path, main_html, "", "", "", true, false, st);
+}
+
+const captcha_answer = "LETMEIN";
+const captcha_png = @embedFile("captcha.png");
+
+pub fn captchaPng(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    res.status = 200;
+    res.content_type = httpz.ContentType.PNG;
+    res.body = captcha_png;
+}
+
+pub fn signupPage(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const form = try std.fmt.allocPrint(a,
+        \\<h1>sign up</h1>
+        \\<form class="edit_form" method="post" action="{s}/ui/signup">
+        \\<p>username<br><input type="text" name="handle" required pattern="[a-z0-9_-]+" title="lowercase letters, digits, - and _"></p>
+        \\<p>password<br><input type="password" name="password" required minlength="8"></p>
+        \\<p>enter the text from the picture<br>
+        \\<img src="{s}/static/captcha.png" alt="captcha" style="max-width:280px"><br>
+        \\<input type="text" name="captcha" required autocomplete="off"></p>
+        \\<p><button type="submit">sign up</button></p>
+        \\</form>
+    , .{ app.base_path, app.base_path });
+    res.content_type = httpz.ContentType.HTML;
+    res.body = try pageShell(a, app.base_path, form, "", "", "", false, false, .{});
+}
+
+pub fn signupSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const fd = try req.formData();
+    const handle = fd.get("handle") orelse return badRequest(res);
+    const password = fd.get("password") orelse return badRequest(res);
+    const captcha = fd.get("captcha") orelse return badRequest(res);
+
+    if (!captchaMatches(captcha)) return signupError(res, "the text from the picture does not match");
+    if (handle.len == 0 or handle.len > 32 or !validHandle(handle)) return signupError(res, "invalid username");
+    if (password.len < 8) return signupError(res, "password must be at least 8 characters");
+
+    var buf: [auth.hash_buf_len]u8 = undefined;
+    const hash = auth.hashPassword(password, &buf, app.io) catch |e| return serverError(res, e);
+
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    if ((db_mod.getUserByHandle(app.db, a, handle) catch |e| return serverError(res, e)) != null)
+        return signupError(res, "username is taken");
+    const uid = (db_mod.createUser(app.db, handle, hash, db_mod.nowUnix()) catch |e| return serverError(res, e)) orelse
+        return signupError(res, "username is taken");
+
+    var tok_buf: [64]u8 = undefined;
+    const token = auth.newSessionToken(&tok_buf, app.io);
+    db_mod.createSession(app.db, token, uid, db_mod.nowUnix() + 90 * 86400) catch |e| return serverError(res, e);
+    const cookie_path = if (app.base_path.len > 0) app.base_path else "/";
+    res.header("Set-Cookie", try std.fmt.allocPrint(a, "vb_session={s}; Path={s}; HttpOnly; SameSite=Lax; Max-Age=7776000", .{ token, cookie_path }));
+    res.status = 302;
+    res.header("Location", try std.fmt.allocPrint(a, "{s}/", .{app.base_path}));
+}
+
+fn captchaMatches(input: []const u8) bool {
+    var cleaned_buf: [64]u8 = undefined;
+    var n: usize = 0;
+    for (input) |c| {
+        if (c == ' ' or c == '\t') continue;
+        if (n >= cleaned_buf.len) return false;
+        cleaned_buf[n] = std.ascii.toUpper(c);
+        n += 1;
+    }
+    return std.mem.eql(u8, cleaned_buf[0..n], captcha_answer);
+}
+
+fn validHandle(h: []const u8) bool {
+    for (h) |c| switch (c) {
+        'a'...'z', '0'...'9', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn signupError(res: *httpz.Response, msg: []const u8) !void {
+    res.status = 400;
+    res.content_type = httpz.ContentType.HTML;
+    res.body = try std.fmt.allocPrint(res.arena, "<p>{s}. <a href=\"signup\">try again</a></p>", .{msg});
 }
 
 fn idParam(req: *httpz.Request) ?i64 {

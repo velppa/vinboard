@@ -64,7 +64,21 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const now = db_mod.nowUnix();
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    // Re-posting a url the user already saved updates it (Pinboard semantics).
+    if (db_mod.findIdByUrlFor(app.db, body.url, auth_uid) catch |e| return dbError(res, e)) |existing| {
+        db_mod.updateBookmark(app.db, existing, .{
+            .title = body.title,
+            .notes = body.notes,
+            .toread = body.toread,
+            .shared = body.shared,
+            .tags = body.tags,
+        }, now) catch |e| return dbError(res, e);
+        db_mod.enqueueArchive(app.db, body.url) catch {};
+        res.status = 200;
+        try res.json(.{ .id = existing }, .{});
+        return;
+    }
     const id = db_mod.insertBookmark(app.db, .{
         .url = body.url,
         .title = body.title,
@@ -72,8 +86,8 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .toread = body.toread,
         .shared = body.shared,
         .tags = body.tags,
-    }, now) catch |e| return dbError(res, e);
-    db_mod.setArchive(app.db, id, "", "", .pending, now) catch {};
+    }, now, auth_uid) catch |e| return dbError(res, e);
+    db_mod.enqueueArchive(app.db, body.url) catch {};
     res.status = 201;
     try res.json(.{ .id = id }, .{});
 }
@@ -89,19 +103,25 @@ pub fn list(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (qs.get("offset")) |v| f.offset = std.fmt.parseInt(i64, v, 10) catch 0;
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    f.user_id = auth_uid;
     const ids = db_mod.listBookmarkIds(app.db, res.arena, f) catch |e| return dbError(res, e);
-    try writeBookmarkArray(app, res, ids);
+    try writeBookmarkArray(app, res, ids, null);
 }
 
 fn isTrue(v: []const u8) bool {
     return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
 }
 
-fn writeBookmarkArray(app: *App, res: *httpz.Response, ids: []const i64) !void {
+fn writeBookmarkArray(app: *App, res: *httpz.Response, ids: []const i64, only_user: ?i64) !void {
     var arr: std.ArrayList(models.Bookmark) = .empty;
     for (ids) |id| {
-        if (try db_mod.getBookmark(app.db, res.arena, id)) |bm| try arr.append(res.arena, bm);
+        if (try db_mod.getBookmark(app.db, res.arena, id)) |bm| {
+            if (only_user) |u| {
+                if (bm.user_id != u) continue;
+            }
+            try arr.append(res.arena, bm);
+        }
     }
     res.status = 200;
     try res.json(arr.items, .{});
@@ -111,13 +131,15 @@ pub fn get(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res, "bad id");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
     const bm = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
+    if (bm.user_id != auth_uid) return notFound(res);
     res.status = 200;
     try res.json(bm, .{});
 }
 
 const PatchBody = struct {
+    url: ?[]const u8 = null,
     title: ?[]const u8 = null,
     notes: ?[]const u8 = null,
     toread: ?bool = null,
@@ -131,8 +153,11 @@ pub fn patch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const body = (try req.json(PatchBody)) orelse return badRequest(res, "invalid json");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    const owned = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
+    if (owned.user_id != auth_uid) return notFound(res);
     db_mod.updateBookmark(app.db, id, .{
+        .url = body.url,
         .title = body.title,
         .notes = body.notes,
         .toread = body.toread,
@@ -147,7 +172,9 @@ pub fn remove(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res, "bad id");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    const owned = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
+    if (owned.user_id != auth_uid) return notFound(res);
     db_mod.deleteBookmark(app.db, id) catch |e| return dbError(res, e);
     res.status = 204;
 }
@@ -157,19 +184,20 @@ pub fn searchH(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const term = qs.get("q") orelse return badRequest(res, "missing q");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
     const ids = db_mod.search(app.db, res.arena, term, 100) catch |e| return dbError(res, e);
-    try writeBookmarkArray(app, res, ids);
+    try writeBookmarkArray(app, res, ids, auth_uid);
 }
 
 pub fn tags(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
     const TagCount = struct { tag: []const u8, count: i64 };
     var arr: std.ArrayList(TagCount) = .empty;
     var st = db_mod.prepareTagCounts(app.db) catch |e| return dbError(res, e);
     defer st.finalize();
+    st.bindInt(1, auth_uid);
     while (st.step() catch |e| return dbError(res, e)) {
         try arr.append(res.arena, .{
             .tag = try res.arena.dupe(u8, st.columnText(0)),
@@ -194,8 +222,8 @@ pub fn importH(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer imp.deinit();
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
-    const n = importer.importInto(app.db, imp) catch |e| return dbError(res, e);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    const n = importer.importInto(app.db, imp, auth_uid) catch |e| return dbError(res, e);
     res.status = 200;
     try res.json(.{ .imported = n }, .{});
 }
@@ -204,10 +232,12 @@ pub fn getArchive(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res, "bad id");
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    if (apiUserId(app, req) == null) return unauthorized(res);
-    var q = app.db.prepare("SELECT html,status FROM archive WHERE bookmark_id=?;") catch |e| return dbError(res, e);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    const owned = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
+    if (owned.user_id != auth_uid) return notFound(res);
+    var q = app.db.prepare("SELECT html,status FROM archive WHERE url=?;") catch |e| return dbError(res, e);
     defer q.finalize();
-    q.bindInt(1, id);
+    q.bindText(1, owned.url);
     const has_row = q.step() catch |e| return dbError(res, e);
     if (!has_row) return notFound(res);
     const html = q.columnText(0);

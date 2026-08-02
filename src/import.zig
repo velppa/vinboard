@@ -87,12 +87,13 @@ pub fn parseSafari(gpa: std.mem.Allocator, json: []const u8) !Imported {
     return .{ .items = items, .created_at = times, .arena = arena };
 }
 
-/// Insert all imported items, skipping urls that already exist. Returns count inserted.
-pub fn importInto(db: *sqlite.Db, imp: Imported) !usize {
+/// Insert all imported items for a user, skipping urls they already have.
+/// Returns count inserted.
+pub fn importInto(db: *sqlite.Db, imp: Imported, user_id: i64) !usize {
     var n: usize = 0;
     for (imp.items, imp.created_at) |nb, t| {
-        if (try urlExists(db, nb.url)) continue;
-        _ = try db_mod.insertBookmark(db, nb, if (t == 0) unixNow() else t);
+        if ((try db_mod.findIdByUrlFor(db, nb.url, user_id)) != null) continue;
+        _ = try db_mod.insertBookmark(db, nb, if (t == 0) unixNow() else t, user_id);
         n += 1;
     }
     return n;
@@ -102,13 +103,6 @@ fn unixNow() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     return ts.sec;
-}
-
-fn urlExists(db: *sqlite.Db, url: []const u8) !bool {
-    var q = try db.prepare("SELECT 1 FROM bookmark WHERE url=? LIMIT 1;");
-    defer q.finalize();
-    q.bindText(1, url);
-    return try q.step();
 }
 
 test "parse pinboard fixture" {
@@ -137,9 +131,9 @@ test "import skips duplicate urls" {
     const json = @embedFile("tests/fixtures/pinboard.json");
     var imp = try parsePinboard(std.testing.allocator, json);
     defer imp.deinit();
-    try std.testing.expectEqual(@as(usize, 2), try importInto(&db, imp));
+    try std.testing.expectEqual(@as(usize, 2), try importInto(&db, imp, 1));
 
     var imp2 = try parsePinboard(std.testing.allocator, json);
     defer imp2.deinit();
-    try std.testing.expectEqual(@as(usize, 0), try importInto(&db, imp2)); // all dupes
+    try std.testing.expectEqual(@as(usize, 0), try importInto(&db, imp2, 1)); // all dupes
 }
