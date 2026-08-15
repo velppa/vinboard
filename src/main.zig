@@ -20,7 +20,7 @@ const usage =
     \\usage: vinboard [options]
     \\
     \\options:
-    \\  --db <path>         sqlite database file (default: vinboard.db)
+    \\  --db <path>         sqlite database file (default: ~/.local/state/vinboard/vinboard.db)
     \\  --port <port>       listen port (default: 4670)
     \\  --base-path <path>  url prefix emitted in pages, for reverse proxies (default: none)
     \\  --archiver <cmd>    page archiver command, must print html to stdout (default: single-file)
@@ -60,7 +60,29 @@ fn parseArgs(alloc: std.mem.Allocator, args: std.process.Args) !Args {
             std.process.exit(1);
         }
     }
+    a.db = try expandTilde(alloc, a.db);
     return a;
+}
+
+// Expand a leading "~/" to $HOME; the path may reach sqlite3_open
+// without ever passing through a shell.
+fn expandTilde(alloc: std.mem.Allocator, path: [:0]const u8) ![:0]const u8 {
+    if (!std.mem.startsWith(u8, path, "~/")) return path;
+    const home = std.mem.span(std.c.getenv("HOME") orelse return path);
+    const buf = try alloc.allocSentinel(u8, home.len + path.len - 1, 0);
+    @memcpy(buf[0..home.len], home);
+    @memcpy(buf[home.len..], path[1..]);
+    return buf;
+}
+
+test expandTilde {
+    const alloc = std.testing.allocator;
+    const home = std.mem.span(std.c.getenv("HOME").?);
+    const expanded = try expandTilde(alloc, "~/x/y.db");
+    defer alloc.free(expanded);
+    try std.testing.expect(std.mem.startsWith(u8, expanded, home));
+    try std.testing.expect(std.mem.endsWith(u8, expanded, "/x/y.db"));
+    try std.testing.expectEqualStrings("/abs/y.db", try expandTilde(alloc, "/abs/y.db"));
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -106,4 +128,5 @@ test {
     _ = @import("pinboard_compat.zig");
     _ = @import("web.zig");
     _ = @import("auth.zig");
+    _ = @import("oidc.zig");
 }

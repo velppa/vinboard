@@ -45,6 +45,10 @@ pub const SCHEMA: [:0]const u8 =
     \\CREATE VIRTUAL TABLE IF NOT EXISTS bookmark_fts USING fts5(
     \\  title, notes, url, tags, body, content='', contentless_delete=1
     \\);
+    \\CREATE TABLE IF NOT EXISTS sysconf(
+    \\  key TEXT PRIMARY KEY,
+    \\  value TEXT NOT NULL
+    \\);
 ;
 
 pub fn migrate(db: *sqlite.Db) !void {
@@ -70,6 +74,10 @@ pub fn migrate(db: *sqlite.Db) !void {
     if (!try hasColumn(db, "user", "settings")) {
         try db.exec("ALTER TABLE user ADD COLUMN settings TEXT NOT NULL DEFAULT '{}';");
     }
+    if (!try hasColumn(db, "user", "oidc_sub")) {
+        try db.exec("ALTER TABLE user ADD COLUMN oidc_sub TEXT NOT NULL DEFAULT '';");
+    }
+    try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_oidc_sub ON user(oidc_sub) WHERE oidc_sub<>'';");
     // Seed the owner; login stays disabled until a password is set.
     try db.exec("INSERT OR IGNORE INTO user(id, handle) VALUES (1, 'velppa');");
 }
@@ -539,6 +547,41 @@ pub fn setUserPassword(db: *sqlite.Db, handle: []const u8, hash: []const u8) !vo
     defer q.finalize();
     q.bindText(1, hash);
     q.bindText(2, handle);
+    _ = try q.step();
+}
+
+/// System-wide config value. Caller owns the returned string.
+pub fn getSysconf(db: *sqlite.Db, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+    var q = try db.prepare("SELECT value FROM sysconf WHERE key=?;");
+    defer q.finalize();
+    q.bindText(1, key);
+    if (!try q.step()) return null;
+    return try alloc.dupe(u8, q.columnText(0));
+}
+
+pub fn setSysconf(db: *sqlite.Db, key: []const u8, value: []const u8) !void {
+    var q = try db.prepare("INSERT INTO sysconf(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;");
+    defer q.finalize();
+    q.bindText(1, key);
+    q.bindText(2, value);
+    _ = try q.step();
+}
+
+/// User id linked to an OIDC subject, if any.
+pub fn userIdByOidcSub(db: *sqlite.Db, sub: []const u8) !?i64 {
+    if (sub.len == 0) return null;
+    var q = try db.prepare("SELECT id FROM user WHERE oidc_sub=? AND oidc_sub<>'';");
+    defer q.finalize();
+    q.bindText(1, sub);
+    if (!try q.step()) return null;
+    return q.columnInt(0);
+}
+
+pub fn setUserOidcSub(db: *sqlite.Db, user_id: i64, sub: []const u8) !void {
+    var q = try db.prepare("UPDATE user SET oidc_sub=? WHERE id=?;");
+    defer q.finalize();
+    q.bindText(1, sub);
+    q.bindInt(2, user_id);
     _ = try q.step();
 }
 

@@ -5,6 +5,7 @@ const db_mod = @import("db.zig");
 const models = @import("models.zig");
 const html = @import("html.zig");
 const auth = @import("auth.zig");
+const oidc = @import("oidc.zig");
 
 const App = server.App;
 
@@ -38,6 +39,9 @@ pub fn registerRoutes(router: anytype) void {
     router.*.get("/static/captcha.png", captchaPng, .{});
     router.*.post("/ui/login", loginSubmit, .{});
     router.*.post("/ui/logout", logoutSubmit, .{});
+    router.*.get("/oidc/login", oidcLogin, .{});
+    router.*.get("/oidc/callback", oidcCallback, .{});
+    router.*.post("/ui/oidc", oidcConfigSubmit, .{});
     router.*.get("/static/style.css", styleCss, .{});
     // Glob fallback: serves /u:<handle> pages, 404 otherwise.
     router.*.get("/*", fallbackRoute, .{});
@@ -1279,18 +1283,141 @@ pub fn loginPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
     const qs = try req.query();
     const next = qs.get("next") orelse "";
-    const form = try std.fmt.allocPrint(a,
-        \\<h1>log in</h1>
-        \\<form class="edit_form" method="post" action="{s}/ui/login">
-        \\<input type="hidden" name="next" value="{s}">
-        \\<p>username<br><input type="text" name="handle" required></p>
-        \\<p>password<br><input type="password" name="password" required></p>
-        \\<p><button class="search_btn" type="submit">log in</button></p>
-        \\</form>
-        \\<p class="faint">no account? <a href="{s}/signup">sign up</a></p>
-    , .{ app.base_path, try esc(a, next), app.base_path });
+    const cfg = blk: {
+        app.db_mutex.lockUncancelable(app.io);
+        defer app.db_mutex.unlock(app.io);
+        break :blk loadOidcConfig(app, a);
+    };
+    var form: std.ArrayList(u8) = .empty;
+    try form.appendSlice(a, "<h1>log in</h1>\n");
+    if (cfg.enabled()) {
+        try form.appendSlice(a, try std.fmt.allocPrint(a,
+            \\<p><a href="{s}/oidc/login"><button type="button">log in with sso</button></a></p>
+            \\
+        , .{app.base_path}));
+    }
+    if (cfg.builtinAllowed()) {
+        try form.appendSlice(a, try std.fmt.allocPrint(a,
+            \\<form class="edit_form" method="post" action="{s}/ui/login">
+            \\<input type="hidden" name="next" value="{s}">
+            \\<p>username<br><input type="text" name="handle" required></p>
+            \\<p>password<br><input type="password" name="password" required></p>
+            \\<p><button class="search_btn" type="submit">log in</button></p>
+            \\</form>
+            \\<p class="faint">no account? <a href="{s}/signup">sign up</a></p>
+        , .{ app.base_path, try esc(a, next), app.base_path }));
+    }
     res.content_type = httpz.ContentType.HTML;
-    res.body = try pageShell(a, app.base_path, form, "", "", "", false, false, .{});
+    res.body = try pageShell(a, app.base_path, form.items, "", "", "", false, false, .{});
+}
+
+/// OIDC settings from sysconf; arena-allocated strings.  Caller holds
+/// the db lock.
+fn loadOidcConfig(app: *App, a: std.mem.Allocator) oidc.Config {
+    var cfg = oidc.Config{};
+    if (db_mod.getSysconf(app.db, a, "oidc_mode") catch null) |v| cfg.mode = v;
+    if (db_mod.getSysconf(app.db, a, "oidc_issuer") catch null) |v| cfg.issuer = v;
+    if (db_mod.getSysconf(app.db, a, "oidc_client_id") catch null) |v| cfg.client_id = v;
+    if (db_mod.getSysconf(app.db, a, "oidc_client_secret") catch null) |v| cfg.client_secret = v;
+    if (db_mod.getSysconf(app.db, a, "oidc_redirect_uri") catch null) |v| cfg.redirect_uri = v;
+    return cfg;
+}
+
+/// Redirect to the identity provider with a fresh state cookie.
+pub fn oidcLogin(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const cfg = blk: {
+        app.db_mutex.lockUncancelable(app.io);
+        defer app.db_mutex.unlock(app.io);
+        break :blk loadOidcConfig(app, a);
+    };
+    if (!cfg.enabled()) return notFound(res);
+    var state_buf: [64]u8 = undefined;
+    const state = auth.newSessionToken(&state_buf, app.io);
+    const cookie_path = if (app.base_path.len > 0) app.base_path else "/";
+    res.header("Set-Cookie", try std.fmt.allocPrint(a, "vb_oidc_state={s}; Path={s}; HttpOnly; SameSite=Lax; Max-Age=600", .{ state, cookie_path }));
+    res.status = 302;
+    res.header("Location", try oidc.authUrl(a, cfg, state));
+}
+
+/// Provider redirects back here; exchange the code, map claims to a
+/// local user, start a session.
+pub fn oidcCallback(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const qs = try req.query();
+    const code = qs.get("code") orelse return badRequest(res);
+    const state = qs.get("state") orelse return badRequest(res);
+    const cookie = req.header("cookie") orelse return badRequest(res);
+    const want = auth.cookieValue(cookie, "vb_oidc_state") orelse return badRequest(res);
+    if (!std.mem.eql(u8, state, want)) return badRequest(res);
+
+    const cfg = blk: {
+        app.db_mutex.lockUncancelable(app.io);
+        defer app.db_mutex.unlock(app.io);
+        break :blk loadOidcConfig(app, a);
+    };
+    if (!cfg.enabled()) return notFound(res);
+
+    // Network round-trip to the issuer; deliberately outside the db lock.
+    const claims = oidc.exchangeCode(a, app.io, cfg, code) catch {
+        res.status = 502;
+        res.content_type = httpz.ContentType.HTML;
+        res.body = "<p>sso sign-in failed. <a href=\"login\">try again</a></p>";
+        return;
+    };
+
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const uid = oidcUserId(app, a, claims) catch |e| return serverError(res, e);
+
+    var tok_buf: [64]u8 = undefined;
+    const token = auth.newSessionToken(&tok_buf, app.io);
+    db_mod.createSession(app.db, token, uid, db_mod.nowUnix() + 90 * 86400) catch |e| return serverError(res, e);
+    const cookie_path = if (app.base_path.len > 0) app.base_path else "/";
+    res.header("Set-Cookie", try std.fmt.allocPrint(a, "vb_session={s}; Path={s}; HttpOnly; SameSite=Lax; Max-Age=7776000", .{ token, cookie_path }));
+    res.header("Set-Cookie", try std.fmt.allocPrint(a, "vb_oidc_state=; Path={s}; HttpOnly; SameSite=Lax; Max-Age=0", .{cookie_path}));
+    res.status = 302;
+    res.header("Location", try std.fmt.allocPrint(a, "{s}/", .{app.base_path}));
+}
+
+/// Local user for OIDC claims: match by subject, else link an existing
+/// user with the claimed handle, else create one.  Caller holds the db
+/// lock.
+fn oidcUserId(app: *App, a: std.mem.Allocator, claims: oidc.Claims) !i64 {
+    if (try db_mod.userIdByOidcSub(app.db, claims.sub)) |uid| return uid;
+    var buf: [32]u8 = undefined;
+    const handle = oidc.proposeHandle(claims, &buf);
+    if (try db_mod.getUserByHandle(app.db, a, handle)) |existing| {
+        try db_mod.setUserOidcSub(app.db, existing.id, claims.sub);
+        return existing.id;
+    }
+    const uid = (try db_mod.createUser(app.db, handle, "", db_mod.nowUnix())) orelse return error.UserCreateFailed;
+    try db_mod.setUserOidcSub(app.db, uid, claims.sub);
+    return uid;
+}
+
+/// Admin-only: save OIDC settings from the /system form.
+pub fn oidcConfigSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const fd = try req.formData();
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const uid = sessionUserId(app, req) orelse return loginRequired(res);
+    if (!loadSettings(app, a, uid).admin) return notFound(res);
+
+    const mode = fd.get("mode") orelse "builtin";
+    if (!std.mem.eql(u8, mode, "builtin") and !std.mem.eql(u8, mode, "oidc") and !std.mem.eql(u8, mode, "both"))
+        return badRequest(res);
+    db_mod.setSysconf(app.db, "oidc_mode", mode) catch |e| return serverError(res, e);
+    db_mod.setSysconf(app.db, "oidc_issuer", std.mem.trimEnd(u8, fd.get("issuer") orelse "", "/")) catch |e| return serverError(res, e);
+    db_mod.setSysconf(app.db, "oidc_client_id", fd.get("client_id") orelse "") catch |e| return serverError(res, e);
+    // Empty secret keeps the stored one, so the form can omit it.
+    if (fd.get("client_secret")) |secret| {
+        if (secret.len > 0) db_mod.setSysconf(app.db, "oidc_client_secret", secret) catch |e| return serverError(res, e);
+    }
+    db_mod.setSysconf(app.db, "oidc_redirect_uri", fd.get("redirect_uri") orelse "") catch |e| return serverError(res, e);
+    res.status = 302;
+    res.header("Location", try std.fmt.allocPrint(a, "{s}/system", .{app.base_path}));
 }
 
 pub fn loginSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -1301,6 +1428,7 @@ pub fn loginSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
+    if (!loadOidcConfig(app, a).builtinAllowed()) return loginFailed(res);
     const user = (db_mod.getUserByHandle(app.db, a, handle) catch |e| return serverError(res, e)) orelse return loginFailed(res);
     if (!auth.verifyPassword(user.password_hash, password)) return loginFailed(res);
 
@@ -1388,6 +1516,7 @@ pub fn systemPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         break :blk q.columnInt(0);
     };
 
+    const cfg = loadOidcConfig(app, a);
     const main_html = try std.fmt.allocPrint(a,
         \\<h1>system</h1>
         \\<p><b>{d}</b> users: {s}</p>
@@ -1395,7 +1524,34 @@ pub fn systemPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         \\<p><b>{d}</b> items in the archiving queue</p>
         \\<p><b>{d}</b> dead links</p>
         \\<p>db size <b>{d:.1}</b> MB</p>
-    , .{ n_users, users_html.items, n_bookmarks, pending, dead, @as(f64, @floatFromInt(db_bytes)) / (1024.0 * 1024.0) });
+        \\<h1>authorization</h1>
+        \\<form class="edit_form" method="post" action="{s}/ui/oidc">
+        \\<p>mode<br>
+        \\<label><input type="radio" name="mode" value="builtin" {s}> builtin</label>
+        \\<label><input type="radio" name="mode" value="oidc" {s}> sso</label>
+        \\<label><input type="radio" name="mode" value="both" {s}> both</label></p>
+        \\<p>issuer (e.g. https://auth.example.com/oidc)<br><input type="text" name="issuer" value="{s}"></p>
+        \\<p>client id<br><input type="text" name="client_id" value="{s}"></p>
+        \\<p>client secret (leave empty to keep)<br><input type="password" name="client_secret" value=""></p>
+        \\<p>redirect uri (this instance's public /oidc/callback)<br><input type="text" name="redirect_uri" value="{s}"></p>
+        \\<p><button type="submit">save</button></p>
+        \\</form>
+        \\<p class="faint">sso users are matched by subject, then linked by username; new users are created otherwise.</p>
+    , .{
+        n_users,
+        users_html.items,
+        n_bookmarks,
+        pending,
+        dead,
+        @as(f64, @floatFromInt(db_bytes)) / (1024.0 * 1024.0),
+        app.base_path,
+        if (std.mem.eql(u8, cfg.mode, "builtin")) "checked" else "",
+        if (std.mem.eql(u8, cfg.mode, "oidc")) "checked" else "",
+        if (std.mem.eql(u8, cfg.mode, "both")) "checked" else "",
+        try esc(a, cfg.issuer),
+        try esc(a, cfg.client_id),
+        try esc(a, cfg.redirect_uri),
+    });
 
     res.content_type = httpz.ContentType.HTML;
     res.body = try pageShell(a, app.base_path, main_html, "", "", "", true, false, st);
