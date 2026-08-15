@@ -5,11 +5,18 @@
 // Link posts save their target URL (reddit permalink kept in notes);
 // self posts save the reddit permalink. Tags: reddit + subreddit.
 //
-// Requires a Reddit "script" app (https://www.reddit.com/prefs/apps).
-// With 2FA enabled, set REDDIT_PASSWORD to "password:otp".
+// Two auth modes:
+//   Cookie (default, no app registration needed): set REDDIT_COOKIE to your
+//     browser's reddit.com Cookie header (reddit_session=... is enough) and
+//     the script pages old.reddit.com/user/<you>/upvoted.json. Works from
+//     residential IPs; Reddit blocks most datacenter ranges.
+//   OAuth script app: set REDDIT_CLIENT_ID/SECRET/PASSWORD instead.
+//     With 2FA enabled, set REDDIT_PASSWORD to "password:otp".
 //
 // Env:
-//   REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD
+//   REDDIT_USERNAME              always required
+//   REDDIT_COOKIE                cookie mode
+//   REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_PASSWORD   oauth mode
 //   VINBOARD_AUTH   handle:TOKEN (from /v1/user/api_token or settings)
 //   VINBOARD_URL    default https://hotter.myaddr.dev/vinboard
 //
@@ -28,17 +35,21 @@ const DRY = process.argv.includes("--dry-run");
 const limIx = process.argv.indexOf("--limit");
 const MAX = limIx > -1 ? Number(process.argv[limIx + 1]) : Infinity;
 
-const CLIENT_ID = env("REDDIT_CLIENT_ID");
-const CLIENT_SECRET = env("REDDIT_CLIENT_SECRET");
+const COOKIE = process.env.REDDIT_COOKIE;
 const USERNAME = env("REDDIT_USERNAME");
-const PASSWORD = env("REDDIT_PASSWORD");
 const VINBOARD_AUTH = DRY ? process.env.VINBOARD_AUTH : env("VINBOARD_AUTH");
 const VINBOARD_URL = (process.env.VINBOARD_URL || "https://hotter.myaddr.dev/vinboard").replace(/\/$/, "");
-const UA = `vinboard-import/1.0 by ${USERNAME}`;
+const UA = COOKIE
+  ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+  : `vinboard-import/1.0 by ${USERNAME}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function redditToken() {
+  if (COOKIE) return null;
+  const CLIENT_ID = env("REDDIT_CLIENT_ID");
+  const CLIENT_SECRET = env("REDDIT_CLIENT_SECRET");
+  const PASSWORD = env("REDDIT_PASSWORD");
   const res = await fetch("https://www.reddit.com/api/v1/access_token", {
     method: "POST",
     headers: {
@@ -56,11 +67,17 @@ async function redditToken() {
 async function* upvoted(token) {
   let after = null;
   while (true) {
-    const u = new URL(`https://oauth.reddit.com/user/${USERNAME}/upvoted`);
+    const base = COOKIE
+      ? `https://old.reddit.com/user/${USERNAME}/upvoted.json`
+      : `https://oauth.reddit.com/user/${USERNAME}/upvoted`;
+    const u = new URL(base);
     u.searchParams.set("limit", "100");
     u.searchParams.set("type", "links");
     if (after) u.searchParams.set("after", after);
-    const res = await fetch(u, { headers: { Authorization: `Bearer ${token}`, "User-Agent": UA } });
+    const headers = COOKIE
+      ? { Cookie: COOKIE, "User-Agent": UA }
+      : { Authorization: `Bearer ${token}`, "User-Agent": UA };
+    const res = await fetch(u, { headers });
     if (!res.ok) throw new Error(`reddit listing failed: ${res.status} ${await res.text()}`);
     const j = await res.json();
     for (const c of j.data.children) if (c.kind === "t3") yield c.data;
@@ -93,7 +110,7 @@ async function saveToVinboard(bm) {
   return (await res.json()).result_code;
 }
 
-const token = await redditToken();
+const token = COOKIE ? null : await redditToken();
 let n = 0, added = 0, dup = 0;
 for await (const post of upvoted(token)) {
   if (n >= MAX) break;
