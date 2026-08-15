@@ -90,10 +90,26 @@ async function* upvoted(token) {
 function toBookmark(p) {
   const permalink = `https://www.reddit.com${p.permalink}`;
   const isSelf = p.is_self || !p.url || p.url.startsWith(permalink);
+  // Notes carry the post's own content: selftext for self posts, the
+  // permalink for link posts, plus direct image URLs for galleries.
+  // The archive worker captures the bookmarked URL itself (full page,
+  // images inlined), so notes are capped to fit the request line.
+  let notes = isSelf ? (p.selftext || "") : permalink;
+  if (p.is_gallery && p.media_metadata) {
+    const imgs = (p.gallery_data?.items || [])
+      .map((it) => {
+        const m = p.media_metadata[it.media_id];
+        const u = m?.s?.u || m?.s?.gif || m?.s?.mp4;
+        return u ? u.replaceAll("&amp;", "&") : null;
+      })
+      .filter(Boolean);
+    if (imgs.length) notes = `${notes}\n\nImages:\n${imgs.join("\n")}`.trim();
+  }
+  if (notes.length > 3000) notes = notes.slice(0, 3000) + "\u2026";
   return {
     url: isSelf ? permalink : p.url,
     description: p.title || permalink,
-    extended: isSelf ? "" : permalink,
+    extended: notes,
     tags: `reddit ${p.subreddit.toLowerCase()}`,
     dt: new Date(p.created_utc * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
   };
