@@ -7,3 +7,9 @@ int zig_sqlite3_bind_text_transient(
 {
     return sqlite3_bind_text(stmt, i, text, len, SQLITE_TRANSIENT);
 }
+
+int zig_sqlite3_bind_blob_transient(
+    sqlite3_stmt *stmt, int i, const void *blob, int len)
+{
+    return sqlite3_bind_blob(stmt, i, blob, len, SQLITE_TRANSIENT);
+}

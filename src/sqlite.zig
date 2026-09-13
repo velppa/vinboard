@@ -14,6 +14,13 @@ extern fn zig_sqlite3_bind_text_transient(
     len: c_int,
 ) c_int;
 
+extern fn zig_sqlite3_bind_blob_transient(
+    stmt: *c.sqlite3_stmt,
+    i: c_int,
+    blob: [*]const u8,
+    len: c_int,
+) c_int;
+
 pub const Db = struct {
     handle: *c.sqlite3,
 
@@ -67,6 +74,9 @@ pub const Stmt = struct {
     pub fn bindText(self: *Stmt, i: c_int, v: []const u8) void {
         _ = zig_sqlite3_bind_text_transient(self.ptr, i, v.ptr, @intCast(v.len));
     }
+    pub fn bindBlob(self: *Stmt, i: c_int, v: []const u8) void {
+        _ = zig_sqlite3_bind_blob_transient(self.ptr, i, v.ptr, @intCast(v.len));
+    }
     pub fn bindInt(self: *Stmt, i: c_int, v: i64) void {
         _ = c.sqlite3_bind_int64(self.ptr, i, v);
     }
@@ -80,6 +90,13 @@ pub const Stmt = struct {
             c.SQLITE_DONE => false,
             else => error.StepFailed,
         };
+    }
+    /// Slice valid until the next step/finalize. Caller dupes if it must outlive.
+    pub fn columnBlob(self: *Stmt, i: c_int) []const u8 {
+        const p = c.sqlite3_column_blob(self.ptr, i);
+        if (p == null) return "";
+        const len: usize = @intCast(c.sqlite3_column_bytes(self.ptr, i));
+        return @as([*]const u8, @ptrCast(p))[0..len];
     }
     pub fn columnInt(self: *Stmt, i: c_int) i64 {
         return c.sqlite3_column_int64(self.ptr, i);

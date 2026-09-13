@@ -2,6 +2,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const server = @import("server.zig");
 const db_mod = @import("db.zig");
+const gzip = @import("gzip.zig");
 const models = @import("models.zig");
 
 const App = server.App;
@@ -240,10 +241,10 @@ pub fn getArchive(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     q.bindText(1, owned.url);
     const has_row = q.step() catch |e| return dbError(res, e);
     if (!has_row) return notFound(res);
-    const html = q.columnText(0);
+    const html = gzip.decode(res.arena, q.columnBlob(0)) catch |e| return dbError(res, e);
     res.status = 200;
     res.content_type = httpz.ContentType.HTML;
-    res.body = try res.arena.dupe(u8, html);
+    res.body = html;
 }
 
 fn idParam(req: *httpz.Request) ?i64 {

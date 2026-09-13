@@ -1,5 +1,6 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
+const gzip = @import("gzip.zig");
 const models = @import("models.zig");
 
 pub const SCHEMA: [:0]const u8 =
@@ -80,6 +81,48 @@ pub fn migrate(db: *sqlite.Db) !void {
     try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_oidc_sub ON user(oidc_sub) WHERE oidc_sub<>'';");
     // Seed the owner; login stays disabled until a password is set.
     try db.exec("INSERT OR IGNORE INTO user(id, handle) VALUES (1, 'velppa');");
+    try compressStoredPages(db);
+}
+
+/// One-off pass: compress page copies stored before compression
+/// existed.  Rows are converted one at a time so an interrupted run
+/// simply resumes where it stopped.
+fn compressStoredPages(db: *sqlite.Db) !void {
+    const alloc = std.heap.page_allocator;
+    if (try getSysconf(db, alloc, "archive_html_compressed")) |v| {
+        alloc.free(v);
+        return;
+    }
+    var converted: usize = 0;
+    while (true) {
+        var url: []u8 = undefined;
+        var html: []u8 = undefined;
+        {
+            // hex() is how SQL tells a gzip header from page text.
+            var q = try db.prepare(
+                \\SELECT url, html FROM archive
+                \\WHERE html IS NOT NULL AND length(html) > 0
+                \\  AND hex(substr(html,1,2)) <> '1F8B' LIMIT 1;
+            );
+            defer q.finalize();
+            if (!try q.step()) break;
+            url = try alloc.dupe(u8, q.columnText(0));
+            html = try alloc.dupe(u8, q.columnBlob(1));
+        }
+        defer alloc.free(url);
+        defer alloc.free(html);
+
+        const stored = try gzip.compress(alloc, html);
+        defer alloc.free(stored);
+        var up = try db.prepare("UPDATE archive SET html=? WHERE url=?;");
+        defer up.finalize();
+        up.bindBlob(1, stored);
+        up.bindText(2, url);
+        _ = try up.step();
+        converted += 1;
+    }
+    if (converted > 0) std.log.info("compressed {d} archived pages", .{converted});
+    try setSysconf(db, "archive_html_compressed", "1");
 }
 
 /// One-off rebuild: bookmark url unique per user, archive keyed by url
@@ -710,15 +753,20 @@ pub fn nowUnix() i64 {
     return @intCast(ts.sec);
 }
 
-/// Store archived text + status, then refresh FTS so body becomes searchable.
+/// Store the archived page (html compressed) + status, then refresh
+/// FTS so body becomes searchable.
 pub fn setArchive(db: *sqlite.Db, url: []const u8, html: []const u8, text: []const u8, status: models.ArchiveStatus, now: i64) !void {
+    // Only the html is compressed; text stays readable to SQL, which
+    // reads it when building the fts body.
+    const stored = try gzip.compress(std.heap.page_allocator, html);
+    defer std.heap.page_allocator.free(stored);
     var s = try db.prepare(
         "INSERT INTO archive(url,html,text,fetched_at,status) VALUES (?,?,?,?,?) " ++
         "ON CONFLICT(url) DO UPDATE SET html=excluded.html,text=excluded.text,fetched_at=excluded.fetched_at,status=excluded.status;",
     );
     defer s.finalize();
     s.bindText(1, url);
-    s.bindText(2, html);
+    s.bindBlob(2, stored);
     s.bindText(3, text);
     s.bindInt(4, now);
     s.bindText(5, @tagName(status));
@@ -741,6 +789,46 @@ pub fn enqueueArchive(db: *sqlite.Db, url: []const u8) !void {
     defer s.finalize();
     s.bindText(1, url);
     _ = try s.step();
+}
+
+test "stored pages are compressed on write and read back" {
+    var db = try testDb();
+    defer db.close();
+    const html = "<html>" ++ ("zebra " ** 400) ++ "</html>";
+    try setArchive(&db, "https://p", html, "zebra", .done, 2);
+
+    var q = try db.prepare("SELECT hex(substr(html,1,2)), html FROM archive WHERE url=?;");
+    defer q.finalize();
+    q.bindText(1, "https://p");
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("1F8B", q.columnText(0));
+    const back = try gzip.decode(testing.allocator, q.columnBlob(1));
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings(html, back);
+}
+
+test "the one-off pass converts pages stored before compression" {
+    var db = try testDb();
+    defer db.close();
+    var ins = try db.prepare("INSERT INTO archive(url,html,text,status) VALUES (?,?,'','done');");
+    ins.bindText(1, "https://old");
+    ins.bindText(2, "<html>plain</html>");
+    _ = try ins.step();
+    ins.finalize();
+
+    // migrate() already marked this database converted; an older one
+    // reaching the pass for the first time carries no such mark.
+    try db.exec("DELETE FROM sysconf WHERE key='archive_html_compressed';");
+    try compressStoredPages(&db);
+
+    var q = try db.prepare("SELECT html FROM archive WHERE url='https://old';");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    const stored = q.columnBlob(0);
+    try testing.expect(gzip.isGzip(stored));
+    const back = try gzip.decode(testing.allocator, stored);
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings("<html>plain</html>", back);
 }
 
 test "archived text becomes searchable" {
