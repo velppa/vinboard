@@ -3,6 +3,7 @@ const httpz = @import("httpz");
 const server = @import("server.zig");
 const api = @import("api.zig");
 const db_mod = @import("db.zig");
+const suggest_mod = @import("suggest.zig");
 const import_mod = @import("import.zig");
 
 const App = server.App;
@@ -140,7 +141,14 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var tag_list: std.ArrayList([]const u8) = .empty;
     var tag_it = std.mem.tokenizeScalar(u8, tags_str, ' ');
     while (tag_it.next()) |t| try tag_list.append(res.arena, t);
-    const tags = try tag_list.toOwnedSlice(res.arena);
+    var tags: []const []const u8 = try tag_list.toOwnedSlice(res.arena);
+    // Pinboard clients that post without tags get the model's.
+    if (tags.len == 0) {
+        app.db_mutex.lockUncancelable(app.io);
+        const uid = api.apiUserId(app, req);
+        app.db_mutex.unlock(app.io);
+        if (uid) |u| tags = suggest_mod.forBookmark(res.arena, app.io, app.suggest, app.db, app.db_mutex, u, description, url, extended);
+    }
 
     // Parse created_at
     const created_at: i64 = if (dt_str) |dt| import_mod.parseIso(dt) else db_mod.nowUnix();

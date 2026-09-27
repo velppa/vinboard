@@ -1,6 +1,7 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const sqlite = @import("sqlite.zig");
+const suggest = @import("suggest.zig");
 
 pub const App = struct {
     gpa: std.mem.Allocator,
@@ -8,6 +9,7 @@ pub const App = struct {
     db_mutex: *std.Io.Mutex,
     base_path: []const u8,
     shortcut_out: []const u8 = "",
+    suggest: suggest.Config = .{},
     io: std.Io,
 };
 

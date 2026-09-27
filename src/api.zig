@@ -2,6 +2,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const server = @import("server.zig");
 const db_mod = @import("db.zig");
+const suggest_mod = @import("suggest.zig");
 const gzip = @import("gzip.zig");
 const models = @import("models.zig");
 
@@ -63,6 +64,24 @@ const CreateBody = struct {
 pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const body = (try req.json(CreateBody)) orelse return badRequest(res, "invalid json");
     const now = db_mod.nowUnix();
+    // A caller that brought no tags gets the model's, decided before the
+    // database lock is taken and held for the write.
+    const bookmark_tags = if (body.tags.len > 0) body.tags else suggested: {
+        app.db_mutex.lockUncancelable(app.io);
+        const uid = apiUserId(app, req);
+        app.db_mutex.unlock(app.io);
+        break :suggested if (uid) |u| suggest_mod.forBookmark(
+            res.arena,
+            app.io,
+            app.suggest,
+            app.db,
+            app.db_mutex,
+            u,
+            body.title,
+            body.url,
+            body.notes,
+        ) else &.{};
+    };
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
     const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
@@ -73,7 +92,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             .notes = body.notes,
             .toread = body.toread,
             .shared = body.shared,
-            .tags = body.tags,
+            .tags = bookmark_tags,
         }, now) catch |e| return dbError(res, e);
         db_mod.enqueueArchive(app.db, body.url) catch {};
         res.status = 200;
@@ -86,7 +105,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .notes = body.notes,
         .toread = body.toread,
         .shared = body.shared,
-        .tags = body.tags,
+        .tags = bookmark_tags,
     }, now, auth_uid) catch |e| return dbError(res, e);
     db_mod.enqueueArchive(app.db, body.url) catch {};
     res.status = 201;

@@ -2,6 +2,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const server = @import("server.zig");
 const db_mod = @import("db.zig");
+const suggest_mod = @import("suggest.zig");
 const models = @import("models.zig");
 const html = @import("html.zig");
 const auth = @import("auth.zig");
@@ -26,6 +27,7 @@ pub fn registerRoutes(router: anytype) void {
     router.*.get("/setup", setupPage, .{});
     router.*.get("/login", loginPage, .{});
     router.*.get("/ui/tags", tagsJson, .{});
+    router.*.get("/ui/suggest", suggestJson, .{});
     router.*.post("/ui/password", passwordSubmit, .{});
     router.*.post("/ui/token", tokenSubmit, .{});
     router.*.post("/ui/fontsize", fontSizeSubmit, .{});
@@ -95,6 +97,8 @@ const css =
     \\a.tc2 { font-size:1.3em; }
     \\a.tc3 { font-size:1.15em; }
     \\a.tf, a.tf:visited { color:#b97; }
+    \\.prev_saved { background:#fff8dc; border:1px solid #e8d9a0; border-radius:6px; padding:6px 10px; max-width:490px; color:#5a4718; }
+    \\.prev_saved .when { color:inherit; font-size:inherit; }
     \\@media (prefers-color-scheme: dark) {
     \\  body { background:#1c1c1e; color:#ccc; }
     \\  a { color:#7aa2f7; }
@@ -120,12 +124,16 @@ const css =
     \\  a.next_prev { color:#999; }
     \\  input, textarea { background:#2a2a2c; color:#ccc; border-color:#444; }
     \\  .edit_form, .edit_form p { color:#999; }
+    \\  .prev_saved { background:#2e2a1c; border-color:#544a2a; color:#e6d7a4; }
     \\}
     \\.when { font-size:90%; color:#777; }
     \\.faint { color:#aaa; }
     \\.edit_form { color:#888; }
-    \\.edit_form p { line-height:100%; margin-bottom:0; color:#888; }
+    \\.edit_form p { line-height:1.5; margin-bottom:10px; color:#888; }
     \\.edit_form input[type=text], .edit_form input[type=password], .edit_form textarea { width:490px; max-width:95%; margin-bottom:3px; }
+    \\.edit_form textarea[name=title] { resize:none; overflow:hidden; line-height:1.35; padding:2px 3px; }
+    \\.edit_form input[type=checkbox] { width:17px; height:17px; vertical-align:-4px; margin-right:6px; }
+    \\.edit_form label { display:inline-block; margin-right:20px; line-height:2; }
     \\.tag_sug { margin:2px 0 6px; }
     \\.stepper input[type=number] { width:56px; text-align:center; margin:0 4px; }
     \\.stepper button { padding:4px 12px; }
@@ -137,6 +145,27 @@ const css =
     \\  #right_bar { width:auto; }
     \\}
     \\#footer { margin-top:3em; color:#888; clear:both; }
+;
+
+// Fills an empty tags field from the decision model once the form is up.
+// Whatever the visitor types wins: a suggestion that arrives late is dropped
+// rather than overwriting them.
+const suggest_script =
+    \\<script>
+    \\(()=>{
+    \\  const f=document.querySelector('.edit_form'); if(!f)return;
+    \\  // Named controls come from f.elements: a form's own .title property
+    \\  // is the html attribute, not the field.
+    \\  const c=f.elements, el=c.tags, url=c.url.value; if(!el||el.value||!url)return;
+    \\  el.placeholder='suggesting\u2026';
+    \\  const q=new URLSearchParams({url:url,title:c.title.value,notes:c.notes.value});
+    \\  fetch('ui/suggest?'+q).then(r=>r.ok?r.json():null).then(d=>{
+    \\    el.placeholder='';
+    \\    if(d&&d.tags&&d.tags.length&&!el.value&&el!==document.activeElement)
+    \\      el.value=d.tags.join(' ')+' ';
+    \\  }).catch(()=>{el.placeholder='';});
+    \\})();
+    \\</script>
 ;
 
 // Tag autocomplete for any input[name=tags]: suggests existing tags for the
@@ -153,8 +182,15 @@ const tag_js =
     \\    delete el.dataset.ts;
     \\  });
     \\}
-    \\document.addEventListener('DOMContentLoaded',()=>vbLocalTimes());
-    \\document.addEventListener('htmx:afterSwap',e=>vbLocalTimes(e.target));
+    \\function vbGrow(el){el.style.height='auto';el.style.height=el.scrollHeight+'px';}
+    \\function vbGrowAll(root){(root||document).querySelectorAll('textarea[name=title]').forEach(vbGrow);}
+    \\document.addEventListener('DOMContentLoaded',()=>{vbLocalTimes();vbGrowAll();});
+    \\document.addEventListener('htmx:afterSwap',e=>{vbLocalTimes(e.target);vbGrowAll(e.target);});
+    \\document.addEventListener('input',e=>{if(e.target.matches('textarea[name=title]'))vbGrow(e.target);});
+    \\// A title is one line of text, so Enter submits instead of breaking it.
+    \\document.addEventListener('keydown',e=>{
+    \\  if(e.key==='Enter'&&e.target.matches('textarea[name=title]')){e.preventDefault();e.target.form.requestSubmit();}
+    \\});
     \\document.addEventListener('input',e=>{
     \\  const el=e.target; if(el.name!=='tags')return;
     \\  vbTags().then(tags=>{
@@ -762,7 +798,7 @@ pub fn editForm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = try std.fmt.allocPrint(a,
         \\<form class="edit_form" hx-post="{s}/ui/edit/{d}" hx-target="closest .bookmark" hx-swap="innerHTML">
         \\<p>url<br><input type="text" name="url" value="{s}"></p>
-        \\<p>title<br><input type="text" name="title" value="{s}"></p>
+        \\<p>title<br><textarea name="title" rows="1">{s}</textarea></p>
         \\<p>description<br><textarea name="notes" rows="3">{s}</textarea></p>
         \\<p>tags<br><input type="text" name="tags" value="{s}"></p>
         \\<p><label><input type="checkbox" name="private"{s}> private</label>
@@ -781,6 +817,31 @@ pub fn editForm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 fn checked(on: bool) []const u8 {
     return if (on) " checked" else "";
+}
+
+/// A title is a single line; a pasted one may not be. Newlines become
+/// spaces so the stored title matches what the field shows.
+fn oneLine(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfAny(u8, s, "\r\n") == null) return s;
+    const out = try a.dupe(u8, s);
+    for (out) |*c| {
+        if (c.* == '\r' or c.* == '\n') c.* = ' ';
+    }
+    return out;
+}
+
+/// The saved value, or the incoming one where nothing was saved.
+fn pick(saved: []const u8, incoming: []const u8) []const u8 {
+    return if (saved.len > 0) saved else incoming;
+}
+
+fn joinTags(a: std.mem.Allocator, tags: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (tags, 0..) |t, i| {
+        if (i > 0) try out.append(a, ' ');
+        try out.appendSlice(a, t);
+    }
+    return out.toOwnedSlice(a);
 }
 
 fn splitTags(a: std.mem.Allocator, s: []const u8) ![]const []const u8 {
@@ -803,7 +864,7 @@ pub fn editSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const new_url = fd.get("url") orelse "";
     db_mod.updateBookmark(app.db, id, .{
         .url = if (new_url.len > 0) new_url else null,
-        .title = fd.get("title") orelse "",
+        .title = try oneLine(a, fd.get("title") orelse ""),
         .notes = fd.get("notes") orelse "",
         .tags = try splitTags(a, fd.get("tags") orelse ""),
         .shared = fd.get("private") == null,
@@ -854,12 +915,28 @@ pub fn deleteSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
 
 pub fn addPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
+    const qs = try req.query();
+    const url = qs.get("url") orelse "";
+    const popup = qs.get("popup") != null;
+
     var st = Settings{};
+    // The bookmark this url already has, if any: the form opens on top of
+    // it rather than on an empty slate.
+    var prev: ?models.Bookmark = null;
+    var uid: ?i64 = null;
     {
         app.db_mutex.lockUncancelable(app.io);
         defer app.db_mutex.unlock(app.io);
         const maybe_uid = sessionUserId(app, req);
-        if (maybe_uid) |u| st = loadSettings(app, a, u);
+        uid = maybe_uid;
+        if (maybe_uid) |u| {
+            st = loadSettings(app, a, u);
+            if (url.len > 0) {
+                if (db_mod.findIdByUrlFor(app.db, url, u) catch |e| return serverError(res, e)) |id| {
+                    prev = db_mod.getBookmark(app.db, a, id) catch |e| return serverError(res, e);
+                }
+            }
+        }
         if (maybe_uid == null) {
             // Bookmarklet popup lands here logged-out; bounce through the
             // login page and come back with the query intact.
@@ -874,25 +951,51 @@ pub fn addPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             return;
         }
     }
-    const qs = try req.query();
-    const url = qs.get("url") orelse "";
-    const title = qs.get("title") orelse "";
-    const notes = qs.get("notes") orelse "";
-    const popup = qs.get("popup") != null;
+    // What was saved before wins; the incoming values fill whatever it
+    // left empty, so a re-add never drops what is already there and never
+    // discards what the caller brought.
+    const title = pick(if (prev) |b| b.title else "", qs.get("title") orelse "");
+    const notes = pick(if (prev) |b| b.notes else "", qs.get("notes") orelse "");
+    const tags = if (prev) |b| try joinTags(a, b.tags) else "";
+    // A url saved before keeps its tags. Anything new has them fetched once
+    // the form is on screen, because a decision takes about a second and the
+    // popup should not wait for it.
+    const suggest_js = if (prev == null and url.len > 0 and app.suggest.endpoint.len > 0)
+        suggest_script
+    else
+        "";
+
+    const callout = if (prev) |b| try std.fmt.allocPrint(a,
+        \\<p class="prev_saved">previously saved on
+        \\<span class="when" data-ts="{d}">{s}</span></p>
+    , .{ b.created_at, try fmtDateTime(a, b.created_at) }) else "";
 
     const form = try std.fmt.allocPrint(a,
         \\<h1>add bookmark</h1>
+        \\{s}
         \\<form class="edit_form" method="post" action="{s}/ui/add">
         \\<input type="hidden" name="popup" value="{s}">
         \\<p>url<br><input type="text" name="url" value="{s}" required></p>
-        \\<p>title<br><input type="text" name="title" value="{s}"></p>
+        \\<p>title<br><textarea name="title" rows="1">{s}</textarea></p>
         \\<p>description<br><textarea name="notes" rows="3">{s}</textarea></p>
-        \\<p>tags<br><input type="text" name="tags"></p>
-        \\<p><label><input type="checkbox" name="private" checked> private</label>
-        \\   <label><input type="checkbox" name="toread"> read later</label></p>
+        \\<p>tags<br><input type="text" name="tags" value="{s}"></p>
+        \\<p><label><input type="checkbox" name="private"{s}> private</label>
+        \\   <label><input type="checkbox" name="toread"{s}> read later</label></p>
         \\<p><button type="submit">add</button></p>
         \\</form>
-    , .{ app.base_path, if (popup) "1" else "", try esc(a, url), try esc(a, title), try esc(a, notes) });
+        \\{s}
+    , .{
+        callout,
+        app.base_path,
+        if (popup) "1" else "",
+        try esc(a, url),
+        try esc(a, title),
+        try esc(a, notes),
+        try esc(a, tags),
+        checked(if (prev) |b| !b.shared else true),
+        checked(if (prev) |b| b.toread else false),
+        suggest_js,
+    });
 
     res.content_type = httpz.ContentType.HTML;
     if (popup) {
@@ -915,10 +1018,21 @@ pub fn addSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const fd = try req.formData();
     const url = fd.get("url") orelse return badRequest(res);
     if (url.len == 0) return badRequest(res);
+    const title = try oneLine(a, fd.get("title") orelse "");
+    const notes = fd.get("notes") orelse "";
+    var tags = try splitTags(a, fd.get("tags") orelse "");
+    // The form can be submitted with the tags field cleared, so ask the
+    // model before the write rather than leave the bookmark untagged.
+    if (tags.len == 0) {
+        app.db_mutex.lockUncancelable(app.io);
+        const uid = sessionUserId(app, req);
+        app.db_mutex.unlock(app.io);
+        if (uid) |u| tags = suggest_mod.forBookmark(a, app.io, app.suggest, app.db, app.db_mutex, u, title, url, notes);
+    }
     const patch = db_mod.Patch{
-        .title = fd.get("title") orelse "",
-        .notes = fd.get("notes") orelse "",
-        .tags = try splitTags(a, fd.get("tags") orelse ""),
+        .title = title,
+        .notes = notes,
+        .tags = tags,
         .shared = fd.get("private") == null,
         .toread = fd.get("toread") != null,
     };
@@ -1272,6 +1386,24 @@ pub fn tagsJson(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
     res.status = 200;
     try res.json(arr.items, .{});
+}
+
+/// Tags the model suggests for a url the visitor is about to save. Answers
+/// with an empty list rather than an error, so a form never breaks over it.
+pub fn suggestJson(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const qs = try req.query();
+    const url = qs.get("url") orelse "";
+
+    app.db_mutex.lockUncancelable(app.io);
+    const uid = sessionUserId(app, req);
+    app.db_mutex.unlock(app.io);
+
+    const tags: []const []const u8 = if (uid != null and url.len > 0)
+        suggest_mod.forBookmark(a, app.io, app.suggest, app.db, app.db_mutex, uid.?, qs.get("title") orelse "", url, qs.get("notes") orelse "")
+    else
+        &.{};
+    try res.json(.{ .tags = tags }, .{});
 }
 
 fn loginRequired(res: *httpz.Response) !void {
@@ -1657,6 +1789,34 @@ fn notFound(res: *httpz.Response) !void {
 fn serverError(res: *httpz.Response, e: anyerror) !void {
     res.status = 500;
     try res.json(.{ .@"error" = @errorName(e) }, .{});
+}
+
+test "oneLine folds a pasted multi-line title" {
+    const a = std.testing.allocator;
+    const same = try oneLine(a, "already one line");
+    try std.testing.expectEqualStrings("already one line", same);
+
+    const folded = try oneLine(a, "two\r\nlines");
+    defer a.free(folded);
+    try std.testing.expectEqualStrings("two  lines", folded);
+}
+
+test "the add form prefers a saved value and falls back to the incoming one" {
+    try std.testing.expectEqualStrings("saved", pick("saved", "incoming"));
+    try std.testing.expectEqualStrings("incoming", pick("", "incoming"));
+    try std.testing.expectEqualStrings("", pick("", ""));
+}
+
+test "joinTags" {
+    const a = std.testing.allocator;
+    var two = [_][]const u8{ "zig", "sqlite" };
+    const s = try joinTags(a, &two);
+    defer a.free(s);
+    try std.testing.expectEqualStrings("zig sqlite", s);
+
+    const none = try joinTags(a, &.{});
+    defer a.free(none);
+    try std.testing.expectEqualStrings("", none);
 }
 
 test "urlEncode escapes reserved chars" {

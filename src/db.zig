@@ -746,6 +746,43 @@ pub fn prepareTagCounts(db: *sqlite.Db) !sqlite.Stmt {
     );
 }
 
+/// A user's most-used tags, most-used first, at most `limit` of them.
+pub fn topTags(db: *sqlite.Db, alloc: std.mem.Allocator, user_id: i64, limit: usize) ![][]const u8 {
+    var q = try prepareTagCounts(db);
+    defer q.finalize();
+    q.bindInt(1, user_id);
+    var tags: std.ArrayList([]const u8) = .empty;
+    errdefer tags.deinit(alloc);
+    while (tags.items.len < limit and try q.step()) {
+        try tags.append(alloc, try alloc.dupe(u8, q.columnText(0)));
+    }
+    return tags.toOwnedSlice(alloc);
+}
+
+test "topTags ranks by use and stops at the limit" {
+    var db = try testDb();
+    defer db.close();
+    _ = try insertBookmark(&db, .{ .url = "https://a", .tags = &.{ "zig", "hn" } }, 1, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://b", .tags = &.{"hn"} }, 2, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://c", .tags = &.{"food"} }, 3, 2);
+
+    const tags = try topTags(&db, testing.allocator, 1, 10);
+    defer {
+        for (tags) |t| testing.allocator.free(t);
+        testing.allocator.free(tags);
+    }
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("hn", tags[0]);
+    try testing.expectEqualStrings("zig", tags[1]);
+
+    const one = try topTags(&db, testing.allocator, 1, 1);
+    defer {
+        for (one) |t| testing.allocator.free(t);
+        testing.allocator.free(one);
+    }
+    try testing.expectEqual(@as(usize, 1), one.len);
+}
+
 /// Returns current Unix time in seconds.
 pub fn nowUnix() i64 {
     var ts: std.c.timespec = undefined;
