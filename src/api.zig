@@ -146,7 +146,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         }, now) catch |e| return dbError(res, e);
         db_mod.enqueueArchive(app.db, body.url) catch {};
         res.status = 200;
-        try res.json(.{ .id = existing }, .{});
+        try res.json(.{ .id = existing, .status = "updated" }, .{});
         return;
     }
     const id = db_mod.insertBookmark(app.db, .{
@@ -159,7 +159,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }, now, auth_uid) catch |e| return dbError(res, e);
     db_mod.enqueueArchive(app.db, body.url) catch {};
     res.status = 201;
-    try res.json(.{ .id = id }, .{});
+    try res.json(.{ .id = id, .status = "added" }, .{});
 }
 
 pub fn list(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
