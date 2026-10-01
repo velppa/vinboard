@@ -844,41 +844,76 @@ pub fn prepareTagCounts(db: *sqlite.Db) !sqlite.Stmt {
     );
 }
 
-/// A user's most-used tags, most-used first, at most `limit` of them.
-pub fn topTags(db: *sqlite.Db, alloc: std.mem.Allocator, user_id: i64, limit: usize) ![][]const u8 {
-    var q = try prepareTagCounts(db);
+/// A user's most recently used tags, most recent first, at most `limit` of
+/// them.  A tag is as recent as the newest bookmark carrying it.
+pub fn recentTags(db: *sqlite.Db, alloc: std.mem.Allocator, user_id: i64, limit: usize) ![][]const u8 {
+    var q = try db.prepare(
+        \\SELECT t.tag FROM tag t JOIN bookmark b ON b.id=t.bookmark_id
+        \\WHERE b.user_id=?1 GROUP BY t.tag ORDER BY max(b.created_at) DESC, t.tag LIMIT ?2;
+    );
     defer q.finalize();
     q.bindInt(1, user_id);
+    q.bindInt(2, @intCast(limit));
     var tags: std.ArrayList([]const u8) = .empty;
     errdefer tags.deinit(alloc);
-    while (tags.items.len < limit and try q.step()) {
-        try tags.append(alloc, try alloc.dupe(u8, q.columnText(0)));
-    }
+    while (try q.step()) try tags.append(alloc, try alloc.dupe(u8, q.columnText(0)));
     return tags.toOwnedSlice(alloc);
 }
 
-test "topTags ranks by use and stops at the limit" {
+pub const Link = struct { title: []const u8, url: []const u8 };
+
+/// A user's newest bookmarks carrying `tag`, newest first, at most `limit`.
+pub fn recentLinks(db: *sqlite.Db, alloc: std.mem.Allocator, user_id: i64, tag: []const u8, limit: usize) ![]Link {
+    var q = try db.prepare(
+        \\SELECT b.title, b.url FROM bookmark b JOIN tag t ON t.bookmark_id=b.id
+        \\WHERE b.user_id=?1 AND t.tag=?2 ORDER BY b.created_at DESC, b.id DESC LIMIT ?3;
+    );
+    defer q.finalize();
+    q.bindInt(1, user_id);
+    q.bindText(2, tag);
+    q.bindInt(3, @intCast(limit));
+    var links: std.ArrayList(Link) = .empty;
+    errdefer links.deinit(alloc);
+    while (try q.step()) try links.append(alloc, .{
+        .title = try alloc.dupe(u8, q.columnText(0)),
+        .url = try alloc.dupe(u8, q.columnText(1)),
+    });
+    return links.toOwnedSlice(alloc);
+}
+
+test "recentTags ranks by the newest bookmark and stops at the limit" {
     var db = try testDb();
     defer db.close();
-    _ = try insertBookmark(&db, .{ .url = "https://a", .tags = &.{ "zig", "hn" } }, 1, 1);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try insertBookmark(&db, .{ .url = "https://a", .tags = &.{"hn"} }, 1, 1);
     _ = try insertBookmark(&db, .{ .url = "https://b", .tags = &.{"hn"} }, 2, 1);
-    _ = try insertBookmark(&db, .{ .url = "https://c", .tags = &.{"food"} }, 3, 2);
+    _ = try insertBookmark(&db, .{ .url = "https://c", .tags = &.{"zig"} }, 3, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://d", .tags = &.{"food"} }, 4, 2);
 
-    const tags = try topTags(&db, testing.allocator, 1, 10);
-    defer {
-        for (tags) |t| testing.allocator.free(t);
-        testing.allocator.free(tags);
-    }
+    const tags = try recentTags(&db, a, 1, 10);
     try testing.expectEqual(@as(usize, 2), tags.len);
-    try testing.expectEqualStrings("hn", tags[0]);
-    try testing.expectEqualStrings("zig", tags[1]);
+    try testing.expectEqualStrings("zig", tags[0]);
+    try testing.expectEqualStrings("hn", tags[1]);
+    try testing.expectEqual(@as(usize, 1), (try recentTags(&db, a, 1, 1)).len);
+}
 
-    const one = try topTags(&db, testing.allocator, 1, 1);
-    defer {
-        for (one) |t| testing.allocator.free(t);
-        testing.allocator.free(one);
-    }
-    try testing.expectEqual(@as(usize, 1), one.len);
+test "recentLinks lists a tag's newest bookmarks first" {
+    var db = try testDb();
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try insertBookmark(&db, .{ .url = "https://old", .title = "Old", .tags = &.{"hn"} }, 1, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://new", .title = "New", .tags = &.{"hn"} }, 2, 1);
+    _ = try insertBookmark(&db, .{ .url = "https://other", .tags = &.{"zig"} }, 3, 1);
+
+    const links = try recentLinks(&db, a, 1, "hn", 5);
+    try testing.expectEqual(@as(usize, 2), links.len);
+    try testing.expectEqualStrings("https://new", links[0].url);
+    try testing.expectEqualStrings("New", links[0].title);
+    try testing.expectEqual(@as(usize, 1), (try recentLinks(&db, a, 1, "hn", 1)).len);
 }
 
 /// Returns current Unix time in seconds.

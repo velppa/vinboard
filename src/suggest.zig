@@ -13,6 +13,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 const db_mod = @import("db.zig");
+const html = @import("html.zig");
 
 pub const Config = struct {
     /// Full url of a System One endpoint. Empty disables suggestions.
@@ -21,8 +22,11 @@ pub const Config = struct {
     model: []const u8 = "jev",
     /// Bearer token, for an endpoint that wants one.
     api_key: []const u8 = "",
-    /// How many of the user's tags the ranking pass considers.
+    /// How many of the user's most recently used tags the ranking pass
+    /// considers.
     vocabulary: usize = 60,
+    /// How many of a tag's newest bookmarks describe it to the model.
+    examples: usize = 5,
     /// How many of those go on to the yes/no pass.
     shortlist: usize = 5,
     /// Lowest yes/no probability worth suggesting.
@@ -55,11 +59,36 @@ pub fn forBookmark(
     if (cfg.endpoint.len == 0) return &.{};
 
     db_mutex.lockUncancelable(io);
-    const vocabulary = db_mod.topTags(db, alloc, user_id, cfg.vocabulary) catch &.{};
+    const vocabulary = vocabularyFor(alloc, db, user_id, cfg) catch &.{};
     db_mutex.unlock(io);
 
     const st = state(alloc, title, url, notes) catch return &.{};
     return suggest(alloc, io, cfg, st, vocabulary);
+}
+
+/// A tag the model may suggest, with what tells it apart: the user's newest
+/// bookmarks carrying it.
+pub const Tag = struct {
+    name: []const u8,
+    about: []const u8 = "",
+};
+
+fn vocabularyFor(alloc: std.mem.Allocator, db: *sqlite.Db, user_id: i64, cfg: Config) ![]Tag {
+    const names = try db_mod.recentTags(db, alloc, user_id, cfg.vocabulary);
+    const tags = try alloc.alloc(Tag, names.len);
+    for (names, tags) |name, *t| t.* = .{
+        .name = name,
+        .about = try describe(alloc, name, try db_mod.recentLinks(db, alloc, user_id, name, cfg.examples)),
+    };
+    return tags;
+}
+
+/// Lines of "title | url", one per link, each part kept short.
+fn describe(alloc: std.mem.Allocator, name: []const u8, links: []const db_mod.Link) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(alloc, "Recent bookmarks tagged {s}:", .{name});
+    for (links) |l| try out.print(alloc, "\n{s} | {s}", .{ html.prefixUtf8(l.title, 100), html.prefixUtf8(l.url, 150) });
+    return out.toOwnedSlice(alloc);
 }
 
 /// Tags for a bookmark, best first. Empty when suggestion is off, when the
@@ -69,7 +98,7 @@ pub fn suggest(
     io: std.Io,
     cfg: Config,
     st: []const u8,
-    vocabulary: []const []const u8,
+    vocabulary: []const Tag,
 ) []const []const u8 {
     if (cfg.endpoint.len == 0 or vocabulary.len == 0) return &.{};
     return attempt(alloc, io, cfg, st, vocabulary) catch |e| {
@@ -83,7 +112,7 @@ fn attempt(
     io: std.Io,
     cfg: Config,
     st: []const u8,
-    vocabulary: []const []const u8,
+    vocabulary: []const Tag,
 ) ![]const []const u8 {
     const vocab = vocabulary[0..@min(vocabulary.len, cfg.vocabulary)];
     const ranked = try rank(alloc, try post(alloc, io, cfg, try rankBody(alloc, cfg, st, vocab)), vocab);
@@ -96,9 +125,9 @@ fn attempt(
 
 /// One choice question over the vocabulary. The options are the tags
 /// themselves, so the answer comes back keyed by tag.
-fn rankBody(alloc: std.mem.Allocator, cfg: Config, st: []const u8, vocab: []const []const u8) ![]u8 {
+fn rankBody(alloc: std.mem.Allocator, cfg: Config, st: []const u8, vocab: []const Tag) ![]u8 {
     var criteria: std.json.ObjectMap = .empty;
-    for (vocab) |tag| try criteria.put(alloc, tag, .null);
+    for (vocab) |tag| try criteria.put(alloc, tag.name, if (tag.about.len > 0) .{ .string = tag.about } else .null);
 
     var question: std.json.ObjectMap = .empty;
     try question.put(alloc, "type", .{ .string = "choice" });
@@ -120,6 +149,13 @@ fn confirmBody(alloc: std.mem.Allocator, cfg: Config, st: []const u8, short: []c
         try question.put(alloc, "type", .{ .string = "noul" });
         const instructions = try std.fmt.allocPrint(alloc, "Is this bookmark about {s}?", .{cand.tag});
         try question.put(alloc, "instructions", .{ .string = instructions });
+        if (cand.about.len > 0) {
+            var criteria: std.json.ObjectMap = .empty;
+            const yes = try std.fmt.allocPrint(alloc, "It belongs with these. {s}", .{cand.about});
+            try criteria.put(alloc, "true", .{ .string = yes });
+            try criteria.put(alloc, "false", .{ .string = "It is unlike them." });
+            try question.put(alloc, "criteria", .{ .object = criteria });
+        }
         try questions.put(alloc, try key(alloc, i), .{ .object = question });
     }
     return body(alloc, cfg, st, questions);
@@ -163,6 +199,7 @@ fn post(alloc: std.mem.Allocator, io: std.Io, cfg: Config, payload: []const u8) 
 const Scored = struct {
     tag: []const u8,
     p: f64,
+    about: []const u8 = "",
 };
 
 fn byProbability(_: void, a: Scored, b: Scored) bool {
@@ -171,15 +208,15 @@ fn byProbability(_: void, a: Scored, b: Scored) bool {
 
 /// The vocabulary ordered by the ranking pass. Tags the answer does not
 /// mention are dropped; a served model is free to return fewer.
-fn rank(alloc: std.mem.Allocator, json: []const u8, vocab: []const []const u8) ![]Scored {
+fn rank(alloc: std.mem.Allocator, json: []const u8, vocab: []const Tag) ![]Scored {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{});
     const probabilities = (answer(parsed, "tag") orelse return error.MalformedAnswer)
         .object.get("probabilities") orelse return error.MalformedAnswer;
 
     var out: std.ArrayList(Scored) = .empty;
     for (vocab) |tag| {
-        const p = probabilities.object.get(tag) orelse continue;
-        try out.append(alloc, .{ .tag = tag, .p = number(p) });
+        const p = probabilities.object.get(tag.name) orelse continue;
+        try out.append(alloc, .{ .tag = tag.name, .p = number(p), .about = tag.about });
     }
     std.mem.sort(Scored, out.items, {}, byProbability);
     return out.items;
@@ -246,7 +283,7 @@ test "ranking orders the vocabulary and ignores tags the model skipped" {
         \\{"answers":{"tag":{"type":"choice","choice":"ml",
         \\ "probabilities":{"ml":0.2,"hn":0.07,"ai":0.14}}}}
     ;
-    const vocab = [_][]const u8{ "hn", "ml", "ai", "vim" };
+    const vocab = [_]Tag{ .{ .name = "hn" }, .{ .name = "ml" }, .{ .name = "ai" }, .{ .name = "vim" } };
     const ranked = try rank(a, json, &vocab);
 
     try testing.expectEqual(@as(usize, 3), ranked.len);
@@ -310,7 +347,7 @@ test "a malformed answer is an error, not a guess" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const vocab = [_][]const u8{"ml"};
+    const vocab = [_]Tag{.{ .name = "ml" }};
     try testing.expectError(error.MalformedAnswer, rank(a, "{\"answers\":{}}", &vocab));
     try testing.expectError(error.MalformedAnswer, rank(a, "{}", &vocab));
 }
@@ -320,7 +357,7 @@ test "the request carries the state and every tag as an option" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const vocab = [_][]const u8{ "ml", "quote\"tag" };
+    const vocab = [_]Tag{ .{ .name = "ml", .about = "Recent bookmarks tagged ml:\nA | https://a" }, .{ .name = "quote\"tag" } };
     const json = try rankBody(a, .{ .model = "jev-test" }, "a title\nhttps://example.com\n", &vocab);
 
     // Round-trips, so the tag carrying a quote is escaped rather than broken.
@@ -329,6 +366,7 @@ test "the request carries the state and every tag as an option" {
         .get("tag").?.object.get("criteria").?.object;
     try testing.expectEqual(@as(usize, 2), criteria.count());
     try testing.expect(criteria.contains("quote\"tag"));
+    try testing.expectEqualStrings("Recent bookmarks tagged ml:\nA | https://a", criteria.get("ml").?.string);
     try testing.expectEqualStrings("a title\nhttps://example.com\n", parsed.object.get("state").?.string);
     try testing.expectEqualStrings("jev-test", parsed.object.get("model").?.string);
 }

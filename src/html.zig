@@ -20,3 +20,18 @@ test "escape" {
     defer std.testing.allocator.free(e);
     try std.testing.expectEqualStrings("&lt;a&gt;&amp;&quot;", e);
 }
+
+/// The longest prefix of S at most MAX bytes long that ends on a
+/// character boundary.
+pub fn prefixUtf8(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var cut = max;
+    while (cut > 0 and s[cut] & 0xC0 == 0x80) cut -= 1;
+    return s[0..cut];
+}
+
+test "prefixUtf8" {
+    try std.testing.expectEqualStrings("abc", prefixUtf8("abc", 5));
+    try std.testing.expectEqualStrings("ab", prefixUtf8("abc", 2));
+    try std.testing.expectEqualStrings("a", prefixUtf8("a\xc3\xa9", 2));
+}
