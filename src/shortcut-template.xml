@@ -84,12 +84,15 @@
 				<key>InputMode</key>
 				<string>to stdin</string>
 				<key>Script</key>
-				<string>app=$(lsappinfo visibleProcessList | tr ' ' '\n' | sed -n 's/.*"\(.*\)":$/\1/p' | tr _ ' ' |
-	grep -m1 -x -E 'Safari|Google Chrome|Chromium|Brave Browser')
+				<string>apps=$(lsappinfo visibleProcessList | tr ' ' '\n' | sed -n 's/.*"\(.*\)":$/\1/p' | tr _ ' ')
+app=$(printf '%s\n' "$apps" | grep -m1 -x -E 'Safari|Google Chrome|Chromium|Brave Browser')
 case "$app" in
-	Safari) osascript -e 'tell application "Safari" to tell front document to return name &amp; linefeed &amp; URL' ;;
-	?*) osascript -e "tell application \"$app\" to tell active tab of front window to return title &amp; linefeed &amp; URL" ;;
-esac</string>
+	Safari) script='tell application "Safari" to tell front document to return name &amp; linefeed &amp; URL' ;;
+	?*) script="tell application \"$app\" to tell active tab of front window to return title &amp; linefeed &amp; URL" ;;
+	*) echo "no browser among: $(printf '%s ' $apps | head -c 200)"; exit 0 ;;
+esac
+out=$(osascript -e "$script" 2&gt;&amp;1) || out="$app: $out"
+printf '%s\n' "$out"</string>
 				<key>Shell</key>
 				<string>/bin/zsh</string>
 				<key>UUID</key>

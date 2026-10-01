@@ -77,6 +77,17 @@ fn splitShared(url: []const u8, title: []const u8) Shared {
     return .{ .url = text[at..end], .title = if (title.len > 0) title else prefix };
 }
 
+fn isWebUrl(url: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(url, "http://") or std.ascii.startsWithIgnoreCase(url, "https://");
+}
+
+test "isWebUrl" {
+    try std.testing.expect(isWebUrl("https://example.com"));
+    try std.testing.expect(isWebUrl("HTTP://example.com"));
+    try std.testing.expect(!isWebUrl("no browser in front"));
+    try std.testing.expect(!isWebUrl("mailto:me@example.com"));
+}
+
 test "splitShared" {
     const glued = splitShared("Same Content? : r/BeautyGuruChatterhttps://www.reddit.com/r/x/comments/1/y/", "");
     try std.testing.expectEqualStrings("https://www.reddit.com/r/x/comments/1/y/", glued.url);
@@ -101,6 +112,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     body.url = shared.url;
     body.title = shared.title;
     if (body.url.len == 0) return badRequest(res, "url is required");
+    if (!isWebUrl(body.url)) return badRequest(res, "url must start with http:// or https://");
     const now = db_mod.nowUnix();
     // A caller that brought no tags gets the model's, decided before the
     // database lock is taken and held for the write.
