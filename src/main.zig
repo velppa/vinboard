@@ -9,6 +9,7 @@ const suggest_key_name = "suggest_api_key";
 
 const Args = struct {
     db: [:0]const u8 = "~/.local/state/vinboard/vinboard.db",
+    archive_db: [:0]const u8 = "",
     port: u16 = 4670,
     base_path: []const u8 = "",
     archiver: []const u8 = "vinboard-archiver",
@@ -26,6 +27,7 @@ const usage =
     \\
     \\options:
     \\  --db <path>         sqlite database file (default: ~/.local/state/vinboard/vinboard.db)
+    \\  --archive-db <path> sqlite file for archived pages (default: <db>-archive.db next to it)
     \\  --port <port>       listen port (default: 4670)
     \\  --base-path <path>  url prefix emitted in pages, for reverse proxies (default: none)
     \\  --archiver <cmd>    page archiver command, must print html to stdout (default: single-file)
@@ -50,7 +52,9 @@ fn parseArgs(alloc: std.mem.Allocator, args: std.process.Args) !Args {
     var it = args.iterate();
     _ = it.next(); // exe name
     while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--db")) {
+        if (std.mem.eql(u8, arg, "--archive-db")) {
+            a.archive_db = try alloc.dupeZ(u8, it.next() orelse return error.MissingArgValue);
+        } else if (std.mem.eql(u8, arg, "--db")) {
             a.db = try alloc.dupeZ(u8, it.next() orelse return error.MissingArgValue);
         } else if (std.mem.eql(u8, arg, "--port")) {
             a.port = try std.fmt.parseInt(u16, it.next() orelse return error.MissingArgValue, 10);
@@ -79,11 +83,27 @@ fn parseArgs(alloc: std.mem.Allocator, args: std.process.Args) !Args {
         }
     }
     a.db = try expandTilde(alloc, a.db);
+    a.archive_db = if (a.archive_db.len > 0) try expandTilde(alloc, a.archive_db) else try archivePath(alloc, a.db);
     return a;
 }
 
 // Expand a leading "~/" to $HOME; the path may reach sqlite3_open
 // without ever passing through a shell.
+/// The archive database that goes with bookmarks database DB: its name with
+/// "-archive" before the extension.
+fn archivePath(alloc: std.mem.Allocator, db: []const u8) ![:0]const u8 {
+    const stem = if (std.mem.endsWith(u8, db, ".db")) db[0 .. db.len - 3] else db;
+    return std.fmt.allocPrintSentinel(alloc, "{s}-archive.db", .{stem}, 0);
+}
+
+test "archivePath sits next to the bookmarks database" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("/s/vinboard-archive.db", try archivePath(a, "/s/vinboard.db"));
+    try std.testing.expectEqualStrings("/s/db-archive.db", try archivePath(a, "/s/db"));
+}
+
 fn expandTilde(alloc: std.mem.Allocator, path: [:0]const u8) ![:0]const u8 {
     if (!std.mem.startsWith(u8, path, "~/")) return path;
     const home = std.mem.span(std.c.getenv("HOME") orelse return path);
@@ -109,6 +129,7 @@ pub fn main(init: std.process.Init) !void {
 
     var db = try sqlite.Db.open(args.db);
     defer db.close();
+    try db_mod.attachArchive(&db, args.archive_db);
     try db_mod.migrate(&db);
 
     if (args.set_suggest_key) |k| {

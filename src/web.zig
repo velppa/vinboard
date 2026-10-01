@@ -22,6 +22,8 @@ pub fn registerRoutes(router: anytype) void {
     router.*.post("/ui/delete/:id", deleteSubmit, .{});
     router.*.post("/ui/star/:id", starToggle, .{});
     router.*.post("/ui/read/:id", markRead, .{});
+    router.*.get("/ui/archive/:id", archiveControl, .{});
+    router.*.post("/ui/archive/:id", archiveControl, .{});
     router.*.get("/add", addPage, .{});
     router.*.post("/ui/add", addSubmit, .{});
     router.*.get("/setup", setupPage, .{});
@@ -401,10 +403,9 @@ fn renderDisplay(app: *App, a: std.mem.Allocator, bm: models.Bookmark, editable:
             \\<a class="delete" href="#" hx-post="{s}/ui/delete/{d}" hx-confirm="Delete this bookmark?" hx-target="closest .bookmark" hx-swap="delete">delete</a>
         , .{ base, bm.id, base, bm.id }));
     }
-    if (editable and try db_mod.archiveDone(app.db, bm.id)) {
-        try out.appendSlice(a, try std.fmt.allocPrint(a,
-            \\ &nbsp; <a class="archived" href="{s}/api/bookmarks/{d}/archive">archived</a>
-        , .{ base, bm.id }));
+    if (editable) {
+        try out.appendSlice(a, " &nbsp; ");
+        try out.appendSlice(a, try archiveLink(a, base, bm.id, try db_mod.archiveState(app.db, bm.id)));
     }
     if (editable and bm.toread) {
         try out.appendSlice(a, try std.fmt.allocPrint(a,
@@ -413,6 +414,37 @@ fn renderDisplay(app: *App, a: std.mem.Allocator, bm: models.Bookmark, editable:
     }
     try out.appendSlice(a, "</div></div>");
     return out.toOwnedSlice(a);
+}
+
+/// The archive control of a bookmark: a link to its copy, a placeholder that
+/// re-checks while the copy is being made, or a link that starts making one.
+fn archiveLink(a: std.mem.Allocator, base: []const u8, id: i64, state: db_mod.ArchiveState) ![]u8 {
+    return switch (state) {
+        .done => std.fmt.allocPrint(a,
+            \\<a class="archived" href="{s}/api/bookmarks/{d}/archive">archived</a>
+        , .{ base, id }),
+        .pending => std.fmt.allocPrint(a,
+            \\<span class="archived" hx-get="{s}/ui/archive/{d}" hx-trigger="every 3s" hx-swap="outerHTML">archiving&hellip;</span>
+        , .{ base, id }),
+        .none, .failed => std.fmt.allocPrint(a,
+            \\<a class="archived" href="#" title="{s}" hx-post="{s}/ui/archive/{d}" hx-swap="outerHTML">archive</a>
+        , .{ if (state == .failed) "the last attempt failed - try again" else "save a copy of this page", base, id }),
+    };
+}
+
+/// GET: the archive control as it stands.  POST: queue the page, then the
+/// control.  Either way the answer replaces the control in place.
+pub fn archiveControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const a = res.arena;
+    const id = idParam(req) orelse return badRequest(res);
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
+    const bm = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
+    if (req.method == .POST) db_mod.requeueArchive(app.db, bm.url) catch |e| return serverError(res, e);
+    const state = db_mod.archiveState(app.db, id) catch |e| return serverError(res, e);
+    res.content_type = httpz.ContentType.HTML;
+    res.body = try archiveLink(a, app.base_path, id, state);
 }
 
 /// Star column + display: the innerHTML of div.bookmark (htmx swap target).

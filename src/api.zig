@@ -51,6 +51,7 @@ pub fn registerRoutes(router: anytype) void {
     router.*.get("/api/tags", tags, .{});
     router.*.post("/api/import", importH, .{});
     router.*.get("/api/bookmarks/:id/archive", getArchive, .{});
+    router.*.post("/api/bookmarks/:id/archive", requeueArchive, .{});
 }
 
 const CreateBody = struct {
@@ -316,6 +317,9 @@ pub fn importH(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{ .imported = n }, .{});
 }
 
+const archive_csp = "sandbox; default-src 'none'; img-src data: http: https:; " ++
+    "style-src 'unsafe-inline' data: http: https:; font-src data: http: https:; media-src data: http: https:";
+
 pub fn getArchive(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = idParam(req) orelse return badRequest(res, "bad id");
     app.db_mutex.lockUncancelable(app.io);
@@ -331,7 +335,21 @@ pub fn getArchive(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const html = gzip.decode(res.arena, q.columnBlob(0)) catch |e| return dbError(res, e);
     res.status = 200;
     res.content_type = httpz.ContentType.HTML;
+    // A copy of someone else's page: no scripts, and no access to this origin.
+    res.header("Content-Security-Policy", archive_csp);
     res.body = html;
+}
+
+/// Archive a bookmark's page again; answers 202 once it is queued.
+pub fn requeueArchive(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const id = idParam(req) orelse return badRequest(res, "bad id");
+    app.db_mutex.lockUncancelable(app.io);
+    defer app.db_mutex.unlock(app.io);
+    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    const owned = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
+    if (owned.user_id != auth_uid) return notFound(res);
+    db_mod.requeueArchive(app.db, owned.url) catch |e| return dbError(res, e);
+    res.status = 202;
 }
 
 fn idParam(req: *httpz.Request) ?i64 {

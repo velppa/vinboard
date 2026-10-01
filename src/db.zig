@@ -36,13 +36,6 @@ pub const SCHEMA: [:0]const u8 =
     \\  PRIMARY KEY (bookmark_id, tag)
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_tags_tag ON tag(tag);
-    \\CREATE TABLE IF NOT EXISTS archive(
-    \\  url TEXT PRIMARY KEY,
-    \\  html BLOB,
-    \\  text TEXT,
-    \\  fetched_at INTEGER,
-    \\  status TEXT NOT NULL DEFAULT 'pending'
-    \\);
     \\CREATE VIRTUAL TABLE IF NOT EXISTS bookmark_fts USING fts5(
     \\  title, notes, url, tags, body, content='', contentless_delete=1
     \\);
@@ -51,6 +44,44 @@ pub const SCHEMA: [:0]const u8 =
     \\  value TEXT NOT NULL
     \\);
 ;
+
+/// Page copies live in their own database file, attached as `arc`, so the
+/// bookmarks database stays small.  Unqualified `archive` resolves there.
+const ARCHIVE_SCHEMA =
+    \\CREATE TABLE IF NOT EXISTS arc.archive(
+    \\  url TEXT PRIMARY KEY,
+    \\  html BLOB,
+    \\  text TEXT,
+    \\  fetched_at INTEGER,
+    \\  status TEXT NOT NULL DEFAULT 'pending'
+    \\);
+;
+
+/// Attach the database holding archived pages as `arc`.  Call before
+/// `migrate`.
+pub fn attachArchive(db: *sqlite.Db, path: [:0]const u8) !void {
+    var q = try db.prepare("ATTACH DATABASE ? AS arc;");
+    defer q.finalize();
+    q.bindText(1, path);
+    _ = try q.step();
+    try db.exec("PRAGMA arc.journal_mode=WAL;");
+}
+
+/// Move page copies the bookmarks database still holds into the archive
+/// database.  One-way: an older binary no longer finds them.
+fn moveArchive(db: *sqlite.Db) !void {
+    try db.exec(ARCHIVE_SCHEMA);
+    if (!try tableExists(db, "archive")) return;
+    try db.exec(
+        \\BEGIN;
+        \\INSERT OR IGNORE INTO arc.archive(url,html,text,fetched_at,status)
+        \\  SELECT url,html,text,fetched_at,status FROM main.archive;
+        \\DROP TABLE main.archive;
+        \\COMMIT;
+    );
+    try db.exec("VACUUM main;");
+    std.log.info("moved archived pages into the archive database", .{});
+}
 
 pub fn migrate(db: *sqlite.Db) !void {
     // Tables were originally plural; rename before the schema creates
@@ -84,6 +115,7 @@ pub fn migrate(db: *sqlite.Db) !void {
     try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_oidc_sub ON user(oidc_sub) WHERE oidc_sub<>'';");
     // Seed the owner; login stays disabled until a password is set.
     try db.exec("INSERT OR IGNORE INTO user(id, handle) VALUES (1, 'velppa');");
+    try moveArchive(db);
     try compressStoredPages(db);
 }
 
@@ -208,12 +240,14 @@ fn hasColumn(db: *sqlite.Db, table: []const u8, col: []const u8) !bool {
 const testing = std.testing;
 fn testDb() !sqlite.Db {
     var db = try sqlite.Db.openMemory();
+    try attachArchive(&db, ":memory:");
     try migrate(&db);
     return db;
 }
 
 pub fn testDbPub() !sqlite.Db {
     var db = try sqlite.Db.openMemory();
+    try attachArchive(&db, ":memory:");
     try migrate(&db);
     return db;
 }
@@ -224,7 +258,28 @@ test "migrate creates tables" {
     var q = try db.prepare("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('bookmark','tag','archive');");
     defer q.finalize();
     try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 3), q.columnInt(0));
+    try testing.expectEqual(@as(i64, 2), q.columnInt(0));
+    var a = try db.prepare("SELECT count(*) FROM arc.sqlite_master WHERE type='table' AND name='archive';");
+    defer a.finalize();
+    try testing.expect(try a.step());
+    try testing.expectEqual(@as(i64, 1), a.columnInt(0));
+}
+
+test "migrate moves archived pages out of the bookmarks database" {
+    var db = try sqlite.Db.openMemory();
+    defer db.close();
+    try db.exec(
+        \\CREATE TABLE archive(url TEXT PRIMARY KEY, html BLOB, text TEXT, fetched_at INTEGER,
+        \\  status TEXT NOT NULL DEFAULT 'pending');
+        \\INSERT INTO archive VALUES ('https://kept', 'page', 'text', 1, 'done');
+    );
+    try attachArchive(&db, ":memory:");
+    try migrate(&db);
+    try testing.expect(!try tableExists(&db, "archive"));
+    var q = try db.prepare("SELECT status FROM arc.archive WHERE url='https://kept';");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("done", q.columnText(0));
 }
 
 test "migrate creates fts5 table" {
@@ -753,11 +808,30 @@ pub fn deleteSession(db: *sqlite.Db, token: []const u8) !void {
 }
 
 /// True when a fetched archive copy exists for the bookmark.
-pub fn archiveDone(db: *sqlite.Db, id: i64) !bool {
-    var q = try db.prepare("SELECT 1 FROM archive a JOIN bookmark b ON a.url=b.url WHERE b.id=? AND a.status='done';");
+pub const ArchiveState = enum { none, pending, done, failed };
+
+/// Where bookmark ID's page copy stands: none queued, waiting, saved, or
+/// given up on (failed or dead link).
+pub fn archiveState(db: *sqlite.Db, id: i64) !ArchiveState {
+    var q = try db.prepare("SELECT a.status FROM archive a JOIN bookmark b ON a.url=b.url WHERE b.id=?;");
     defer q.finalize();
     q.bindInt(1, id);
-    return try q.step();
+    if (!try q.step()) return .none;
+    const status = q.columnText(0);
+    if (std.mem.eql(u8, status, "done")) return .done;
+    if (std.mem.eql(u8, status, "pending")) return .pending;
+    return .failed;
+}
+
+test "archiveState follows the archive row" {
+    var db = try testDb();
+    defer db.close();
+    const id = try insertBookmark(&db, .{ .url = "https://s" }, 1, 1);
+    try testing.expectEqual(ArchiveState.none, try archiveState(&db, id));
+    try enqueueArchive(&db, "https://s");
+    try testing.expectEqual(ArchiveState.pending, try archiveState(&db, id));
+    try db.exec("UPDATE archive SET status='dead' WHERE url='https://s';");
+    try testing.expectEqual(ArchiveState.failed, try archiveState(&db, id));
 }
 
 /// Returns the id of a bookmark with the given url, or null if not found.
@@ -954,6 +1028,27 @@ pub fn setArchive(db: *sqlite.Db, url: []const u8, html: []const u8, text: []con
 }
 
 /// Queue a url for archiving unless an artifact (or attempt) already exists.
+/// Queue URL to be archived again, keeping the current copy until the new
+/// one replaces it.
+pub fn requeueArchive(db: *sqlite.Db, url: []const u8) !void {
+    var s = try db.prepare("INSERT INTO archive(url) VALUES (?) ON CONFLICT(url) DO UPDATE SET status='pending';");
+    defer s.finalize();
+    s.bindText(1, url);
+    _ = try s.step();
+}
+
+test "requeueArchive puts an archived url back in the queue" {
+    var db = try testDb();
+    defer db.close();
+    try db.exec("INSERT INTO archive(url,html,text,status) VALUES ('https://a','x','y','done');");
+    try requeueArchive(&db, "https://a");
+    var q = try db.prepare("SELECT status, html FROM archive WHERE url='https://a';");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("pending", q.columnText(0));
+    try testing.expectEqualStrings("x", q.columnText(1));
+}
+
 pub fn enqueueArchive(db: *sqlite.Db, url: []const u8) !void {
     var s = try db.prepare("INSERT OR IGNORE INTO archive(url) VALUES (?);");
     defer s.finalize();

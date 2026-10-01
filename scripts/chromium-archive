@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Archive a page through the browser connected to Emacs by browser-gt.
+
+    chromium-archive URL [ignored...]   print the rendered page as html
+    chromium-archive --mhtml FILE       convert a saved MHTML file instead
+
+The page is rendered with the browser's own logins and cookies, captured as
+MHTML, and printed as one self-contained html file: stylesheets, images and
+fonts become data: urls, and scripts are dropped.
+"""
+
+import base64
+import email
+import email.policy
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ELISP = os.path.join(ROOT, "elisp", "vinboard-archive.el")
+TIMEOUT = float(os.environ.get("VINBOARD_ARCHIVE_TIMEOUT", "150"))
+
+
+def capture(url):
+    """MHTML text of URL as the browser renders it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "page.mhtml")
+        form = '(progn (load %s nil t) (vinboard-archive-start %s %s))' % (
+            json.dumps(ELISP), json.dumps(url, ensure_ascii=False), json.dumps(out))
+        subprocess.run(["emacsclient", "--eval", form], check=True,
+                       stdout=subprocess.DEVNULL)
+        deadline = time.time() + TIMEOUT
+        while time.time() < deadline:
+            if os.path.exists(out + ".err"):
+                with open(out + ".err", encoding="utf-8", errors="replace") as f:
+                    raise RuntimeError(f.read())
+            if os.path.exists(out):
+                time.sleep(0.2)  # let the writer finish
+                with open(out, "rb") as f:
+                    return f.read()
+            time.sleep(0.5)
+        raise RuntimeError("timed out waiting for the capture")
+
+
+def data_url(mime, data):
+    return "data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii"))
+
+
+def replace_refs(text, refs):
+    """TEXT with every quoted or url()-wrapped reference in REFS swapped."""
+    if not refs:
+        return text
+    keys = sorted(refs, key=len, reverse=True)
+    variants = {}
+    for k in keys:
+        variants[k] = refs[k]
+        variants[k.replace("&", "&amp;")] = refs[k]
+    pattern = re.compile(
+        r"""(?<=[\s"'(,=])(%s)(?=[\s"'),])""" % "|".join(re.escape(k) for k in sorted(variants, key=len, reverse=True)))
+    return pattern.sub(lambda m: variants[m.group(1)], text)
+
+
+def part_bytes(part):
+    return part.get_payload(decode=True) or b""
+
+
+def part_text(part):
+    """A text part decoded by its declared charset, utf-8 when it has none."""
+    return part_bytes(part).decode(part.get_content_charset() or "utf-8", errors="replace")
+
+
+def to_html(mhtml):
+    """One self-contained html document from MHTML bytes."""
+    msg = email.message_from_bytes(mhtml, policy=email.policy.default)
+    parts = list(msg.iter_parts()) if msg.is_multipart() else [msg]
+    root = next(p for p in parts if p.get_content_type() == "text/html")
+    resources = [p for p in parts if p is not root]
+
+    def names(part):
+        out = []
+        if part["Content-Location"]:
+            out.append(str(part["Content-Location"]).strip())
+        if part["Content-ID"]:
+            out.append("cid:" + str(part["Content-ID"]).strip().strip("<>"))
+        return out
+
+    # Leaves first: images and fonts as they are, then stylesheets (which may
+    # point at them), then frames (which may point at both).
+    refs = {}
+    order = sorted(resources, key=lambda p: {"text/css": 1, "text/html": 2}.get(p.get_content_type(), 0))
+    for part in order:
+        mime = part.get_content_type()
+        if mime in ("text/css", "text/html"):
+            text = part_text(part)
+            text = replace_refs(text, refs)
+            if mime == "text/html":
+                text = strip_scripts(text)
+            url = data_url(mime + ";charset=utf-8", text.encode("utf-8"))
+        else:
+            url = data_url(mime, part_bytes(part))
+        for n in names(part):
+            refs[n] = url
+
+    html = strip_scripts(replace_refs(part_text(root), refs))
+    html = re.sub(r"<meta[^>]+charset[^>]*>", "", html, flags=re.I)
+    head = re.search(r"<head[^>]*>", html, flags=re.I)
+    meta = '<meta charset="utf-8">'
+    html = html[:head.end()] + meta + html[head.end():] if head else meta + html
+    return html.encode("utf-8")
+
+
+def strip_scripts(html):
+    html = re.sub(r"<script\b[^>]*>.*?</script\s*>", "", html, flags=re.I | re.S)
+    return re.sub(r"<script\b[^>]*/>", "", html, flags=re.I)
+
+
+def main(argv):
+    if len(argv) >= 3 and argv[1] == "--mhtml":
+        with open(argv[2], "rb") as f:
+            mhtml = f.read()
+    elif len(argv) >= 2 and not argv[1].startswith("-"):
+        try:
+            mhtml = capture(argv[1])
+        except Exception as e:
+            print("chromium-archive: %s" % e, file=sys.stderr)
+            return 1
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    sys.stdout.buffer.write(to_html(mhtml))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
