@@ -77,6 +77,21 @@ fn splitShared(url: []const u8, title: []const u8) Shared {
     return .{ .url = text[at..end], .title = if (title.len > 0) title else prefix };
 }
 
+/// The longest prefix of S at most MAX bytes long that ends on a
+/// character boundary.
+fn prefixUtf8(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var cut = max;
+    while (cut > 0 and s[cut] & 0xC0 == 0x80) cut -= 1;
+    return s[0..cut];
+}
+
+test "prefixUtf8" {
+    try std.testing.expectEqualStrings("abc", prefixUtf8("abc", 5));
+    try std.testing.expectEqualStrings("ab", prefixUtf8("abc", 2));
+    try std.testing.expectEqualStrings("a", prefixUtf8("a\xc3\xa9", 2));
+}
+
 fn isWebUrl(url: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(url, "http://") or std.ascii.startsWithIgnoreCase(url, "https://");
 }
@@ -112,7 +127,11 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     body.url = shared.url;
     body.title = shared.title;
     if (body.url.len == 0) return badRequest(res, "url is required");
-    if (!isWebUrl(body.url)) return badRequest(res, "url must start with http:// or https://");
+    if (!isWebUrl(body.url)) return badRequest(res, try std.fmt.allocPrint(
+        res.arena,
+        "url must start with http:// or https://, got: {s}",
+        .{prefixUtf8(body.url, 200)},
+    ));
     const now = db_mod.nowUnix();
     // A caller that brought no tags gets the model's, decided before the
     // database lock is taken and held for the write.

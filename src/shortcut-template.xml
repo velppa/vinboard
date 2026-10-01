@@ -85,9 +85,20 @@
 				<string>to stdin</string>
 				<key>Script</key>
 				<string>apps=$(lsappinfo visibleProcessList | tr ' ' '\n' | sed -n 's/.*"\(.*\)":$/\1/p' | tr _ ' ')
-app=$(printf '%s\n' "$apps" | grep -m1 -x -E 'Safari|Google Chrome|Chromium|Brave Browser')
+app=$(printf '%s\n' "$apps" | grep -m1 -x -E 'Safari|Google Chrome|Chromium|Brave Browser|Firefox|Firefox Developer Edition|Firefox Nightly|Zen')
 case "$app" in
 	Safari) script='tell application "Safari" to tell front document to return name &amp; linefeed &amp; URL' ;;
+	Firefox*|Zen) script="tell application \"$app\" to activate
+delay 0.3
+tell application \"System Events\" to tell (first process whose frontmost is true)
+	set t to name of front window
+	keystroke \"l\" using command down
+	delay 0.2
+	set u to value of attribute \"AXValue\" of (value of attribute \"AXFocusedUIElement\")
+	key code 53
+end tell
+if u does not contain \"://\" then set u to \"https://\" &amp; u
+return t &amp; linefeed &amp; u" ;;
 	?*) script="tell application \"$app\" to tell active tab of front window to return title &amp; linefeed &amp; URL" ;;
 	*) echo "no browser among: $(printf '%s ' $apps | head -c 200)"; exit 0 ;;
 esac
