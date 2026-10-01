@@ -16,7 +16,7 @@
 				<key>UUID</key>
 				<string>B1A2C3D4-0001-4E5F-8A9B-0C1D2E3F4A01</string>
 				<key>WFCondition</key>
-				<integer>101</integer>
+				<integer>100</integer>
 				<key>WFControlFlowMode</key>
 				<integer>0</integer>
 				<key>WFInput</key>
