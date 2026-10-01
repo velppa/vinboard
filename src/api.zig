@@ -100,6 +100,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const shared = splitShared(body.url, body.title);
     body.url = shared.url;
     body.title = shared.title;
+    if (body.url.len == 0) return badRequest(res, "url is required");
     const now = db_mod.nowUnix();
     // A caller that brought no tags gets the model's, decided before the
     // database lock is taken and held for the write.

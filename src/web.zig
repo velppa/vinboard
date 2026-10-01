@@ -1291,6 +1291,15 @@ test "shortcut xml carries the escaped credential" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "Bearer me&amp;co:ABC123") != null);
 }
 
+test "every shortcut action carries a uuid" {
+    // Shortcuts keys its saved permission grants by action uuid; an action
+    // without one gets a fresh uuid per run and never matches its grant.
+    const actions = std.mem.count(u8, shortcut_template, "<key>WFWorkflowActionIdentifier</key>");
+    const uuids = std.mem.count(u8, shortcut_template, "<key>UUID</key>");
+    try std.testing.expect(actions > 0);
+    try std.testing.expectEqual(actions, uuids);
+}
+
 pub fn tokenSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
     app.db_mutex.lockUncancelable(app.io);
