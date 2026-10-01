@@ -31,7 +31,7 @@
   :group 'tools
   :prefix "vinboard-")
 
-(defcustom vinboard-base-url "https://hotter.myaddr.dev/vinboard"
+(defcustom vinboard-base-url "https://uiuo.nl/vinboard"
   "Base URL of the vinboard server (no trailing slash).
 The Caddy reverse-proxy prefix is included here; the app itself
 sees plain /api/… paths after Caddy strips the prefix."

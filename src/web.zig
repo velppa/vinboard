@@ -1149,7 +1149,7 @@ pub fn setupPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             \\<p class="faint">Configures the <a href="https://hn.ptpf29qr6x.workers.dev" target="_blank">HN Legible frontend</a> to sync favorites into vinboard.</p>
             \\<p>
             \\<a class="btn" href="https://hn.ptpf29qr6x.workers.dev/setup?token={s}%3A{s}&amp;host=vinboard" target="_blank">setup HN Legible (workers)</a>
-            \\<a class="btn" href="https://hotter.myaddr.dev/hn/#setup?token={s}%3A{s}&amp;workers=cors.ptpf29qr6x.workers.dev&amp;host=vinboard" target="_blank">setup HN Legible (js)</a>
+            \\<a class="btn" href="https://uiuo.nl/hn/#setup?token={s}%3A{s}&amp;workers=cors.ptpf29qr6x.workers.dev&amp;host=vinboard" target="_blank">setup HN Legible (js)</a>
             \\</p>
         , .{ enc_handle, enc_token, enc_handle, enc_token });
     } else "";

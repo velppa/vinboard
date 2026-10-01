@@ -18,7 +18,7 @@
 //   REDDIT_COOKIE                cookie mode
 //   REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_PASSWORD   oauth mode
 //   VINBOARD_AUTH   handle:TOKEN (from /v1/user/api_token or settings)
-//   VINBOARD_URL    default https://hotter.myaddr.dev/vinboard
+//   VINBOARD_URL    default https://uiuo.nl/vinboard
 //
 // Usage: reddit-upvoted.js [--dry-run] [--limit N]
 
@@ -38,7 +38,7 @@ const MAX = limIx > -1 ? Number(process.argv[limIx + 1]) : Infinity;
 const COOKIE = process.env.REDDIT_COOKIE;
 const USERNAME = env("REDDIT_USERNAME");
 const VINBOARD_AUTH = DRY ? process.env.VINBOARD_AUTH : env("VINBOARD_AUTH");
-const VINBOARD_URL = (process.env.VINBOARD_URL || "https://hotter.myaddr.dev/vinboard").replace(/\/$/, "");
+const VINBOARD_URL = (process.env.VINBOARD_URL || "https://uiuo.nl/vinboard").replace(/\/$/, "");
 const UA = COOKIE
   ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
   : `vinboard-import/1.0 by ${USERNAME}`;

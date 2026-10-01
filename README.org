@@ -2,4 +2,4 @@
 
 Vinboard is a bookmarking service heavily inspired by Pinboard.
 
-You can self-host it or use hosted instance on https://hotter.myaddr.dev/vinboard.
+You can self-host it or use hosted instance on https://uiuo.nl/vinboard.
