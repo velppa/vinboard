@@ -158,6 +158,7 @@ test {
     _ = @import("html.zig");
     _ = @import("pinboard_compat.zig");
     _ = @import("web.zig");
+    _ = @import("api.zig");
     _ = @import("auth.zig");
     _ = @import("oidc.zig");
     _ = @import("suggest.zig");

@@ -1220,22 +1220,8 @@ pub fn shortcutDownload(app: *App, req: *httpz.Request, res: *httpz.Response) !v
         }
         cred = try std.fmt.allocPrint(a, "{s}:{s}", .{ handle, token });
     }
-    const argv: []const []const u8 = if (app.shortcut_out.len > 0)
-        &.{ "scripts/make-shortcut.sh", cred, app.shortcut_out }
-    else
-        &.{ "scripts/make-shortcut.sh", cred };
-    const result = std.process.run(app.gpa, app.io, .{
-        .argv = argv,
-        .stdout_limit = .limited(4 * 1024 * 1024),
-        .stderr_limit = .limited(4096),
-    }) catch |e| return serverError(res, e);
-    defer app.gpa.free(result.stderr);
-    defer app.gpa.free(result.stdout);
-    const failed = switch (result.term) {
-        .exited => |code| code != 0,
-        else => true,
-    };
-    if (failed) return serverError(res, error.ShortcutSignFailed);
+    const xml = shortcutXml(a, cred) catch |e| return serverError(res, e);
+    const signed = signShortcut(app, a, xml, app.shortcut_out) catch |e| return serverError(res, e);
     if (app.shortcut_out.len > 0) {
         // Freshly written for the static server; a redirect there serves it
         // with no Content-Type at all, which is what makes iOS Safari offer
@@ -1244,9 +1230,65 @@ pub fn shortcutDownload(app: *App, req: *httpz.Request, res: *httpz.Response) !v
         res.header("Location", "/vinboard.shortcut");
         return;
     }
-    if (result.stdout.len == 0) return serverError(res, error.ShortcutSignFailed);
     res.status = 200;
-    res.body = try a.dupe(u8, result.stdout);
+    res.body = signed;
+}
+
+const shortcut_template = @embedFile("shortcut-template.xml");
+
+/// The unsigned shortcut plist with credential CRED baked in.
+fn shortcutXml(a: std.mem.Allocator, cred: []const u8) ![]u8 {
+    return std.mem.replaceOwned(u8, a, shortcut_template, "__VINBOARD_AUTH__", try esc(a, cred));
+}
+
+/// Sign the shortcut plist XML.  With OUT set, the signed shortcut replaces
+/// the file at OUT atomically and the result is empty; otherwise the signed
+/// bytes are returned.
+fn signShortcut(app: *App, a: std.mem.Allocator, xml: []const u8, out: []const u8) ![]u8 {
+    const io = app.io;
+    const cwd = std.Io.Dir.cwd();
+    var buf: [20]u8 = undefined;
+    const tmp = try std.fmt.allocPrint(a, "/tmp/vinboard-shortcut-{s}", .{auth.newApiToken(&buf, io)});
+    try cwd.createDirPath(io, tmp);
+    defer cwd.deleteTree(io, tmp) catch {};
+    const in_path = try std.fmt.allocPrint(a, "{s}/in.shortcut", .{tmp});
+    try cwd.writeFile(io, .{ .sub_path = in_path, .data = xml });
+    // Signed next to OUT, so the final rename stays on one filesystem.
+    const out_path = if (out.len > 0)
+        try std.fmt.allocPrint(a, "{s}.{s}.tmp", .{ out, buf })
+    else
+        try std.fmt.allocPrint(a, "{s}/out.shortcut", .{tmp});
+    const result = try std.process.run(app.gpa, io, .{
+        .argv = &.{ "shortcuts", "sign", "-m", "anyone", "-i", in_path, "-o", out_path },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    app.gpa.free(result.stdout);
+    app.gpa.free(result.stderr);
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        if (out.len > 0) cwd.deleteFile(io, out_path) catch {};
+        return error.ShortcutSignFailed;
+    }
+    if (out.len > 0) {
+        try cwd.setFilePermissions(io, out_path, .fromMode(0o644), .{});
+        try cwd.rename(out_path, cwd, out, io);
+        return &.{};
+    }
+    const signed = try cwd.readFileAlloc(io, out_path, a, .limited(4 * 1024 * 1024));
+    if (signed.len == 0) return error.ShortcutSignFailed;
+    return signed;
+}
+
+test "shortcut xml carries the escaped credential" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const xml = try shortcutXml(arena.allocator(), "me&co:ABC123");
+    try std.testing.expect(std.mem.indexOf(u8, xml, "__VINBOARD_AUTH__") == null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "Bearer me&amp;co:ABC123") != null);
 }
 
 pub fn tokenSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {

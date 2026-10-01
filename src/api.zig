@@ -61,8 +61,45 @@ const CreateBody = struct {
     tags: []const []const u8 = &.{},
 };
 
+const Shared = struct { url: []const u8, title: []const u8 };
+
+/// Untangle a url that arrived as shared text, "<title><url>" glued
+/// together: the url is the first http(s) link in it, and the text before
+/// that becomes the title unless TITLE is already set.  Text with no link
+/// comes back as it is.
+fn splitShared(url: []const u8, title: []const u8) Shared {
+    const text = std.mem.trim(u8, url, &std.ascii.whitespace);
+    const at = std.ascii.indexOfIgnoreCase(text, "https://") orelse
+        std.ascii.indexOfIgnoreCase(text, "http://") orelse
+        return .{ .url = text, .title = title };
+    const end = std.mem.indexOfAnyPos(u8, text, at, &std.ascii.whitespace) orelse text.len;
+    const prefix = std.mem.trim(u8, text[0..at], &std.ascii.whitespace);
+    return .{ .url = text[at..end], .title = if (title.len > 0) title else prefix };
+}
+
+test "splitShared" {
+    const glued = splitShared("Same Content? : r/BeautyGuruChatterhttps://www.reddit.com/r/x/comments/1/y/", "");
+    try std.testing.expectEqualStrings("https://www.reddit.com/r/x/comments/1/y/", glued.url);
+    try std.testing.expectEqualStrings("Same Content? : r/BeautyGuruChatter", glued.title);
+
+    const plain = splitShared(" https://example.com/a \n", "");
+    try std.testing.expectEqualStrings("https://example.com/a", plain.url);
+    try std.testing.expectEqualStrings("", plain.title);
+
+    const titled = splitShared("Page\nhttp://example.com/b more", "Given");
+    try std.testing.expectEqualStrings("http://example.com/b", titled.url);
+    try std.testing.expectEqualStrings("Given", titled.title);
+
+    const nolink = splitShared("not a link", "");
+    try std.testing.expectEqualStrings("not a link", nolink.url);
+}
+
 pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    const body = (try req.json(CreateBody)) orelse return badRequest(res, "invalid json");
+    var body = (try req.json(CreateBody)) orelse return badRequest(res, "invalid json");
+    // Share sheets often hand over the page as "<title><url>" text.
+    const shared = splitShared(body.url, body.title);
+    body.url = shared.url;
+    body.title = shared.title;
     const now = db_mod.nowUnix();
     // A caller that brought no tags gets the model's, decided before the
     // database lock is taken and held for the write.
