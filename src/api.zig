@@ -121,13 +121,13 @@ test "splitShared" {
 }
 
 pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    var body = (try req.json(CreateBody)) orelse return badRequest(res, "invalid json");
+    var body = (try req.json(CreateBody)) orelse return notSaved(res, 400, "invalid json");
     // Share sheets often hand over the page as "<title><url>" text.
     const shared = splitShared(body.url, body.title);
     body.url = shared.url;
     body.title = shared.title;
-    if (body.url.len == 0) return badRequest(res, "url is required");
-    if (!isWebUrl(body.url)) return badRequest(res, try std.fmt.allocPrint(
+    if (body.url.len == 0) return notSaved(res, 400, "url is required");
+    if (!isWebUrl(body.url)) return notSaved(res, 400, try std.fmt.allocPrint(
         res.arena,
         "url must start with http:// or https://, got: {s}",
         .{prefixUtf8(body.url, 200)},
@@ -153,7 +153,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     };
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);
-    const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
+    const auth_uid = apiUserId(app, req) orelse return notSaved(res, 401, "unauthorized");
     // Re-posting a url the user already saved updates it (Pinboard semantics).
     if (db_mod.findIdByUrlFor(app.db, body.url, auth_uid) catch |e| return dbError(res, e)) |existing| {
         db_mod.updateBookmark(app.db, existing, .{
@@ -165,7 +165,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         }, now) catch |e| return dbError(res, e);
         db_mod.enqueueArchive(app.db, body.url) catch {};
         res.status = 200;
-        try res.json(.{ .id = existing, .status = "updated" }, .{});
+        try res.json(.{ .id = existing, .status = "updated", .message = "Updated in vinboard" }, .{});
         return;
     }
     const id = db_mod.insertBookmark(app.db, .{
@@ -178,7 +178,15 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }, now, auth_uid) catch |e| return dbError(res, e);
     db_mod.enqueueArchive(app.db, body.url) catch {};
     res.status = 201;
-    try res.json(.{ .id = id, .status = "added" }, .{});
+    try res.json(.{ .id = id, .status = "added", .message = "Added to vinboard" }, .{});
+}
+
+/// Answer a create that saved nothing.  The reply's message is ready to show
+/// a person, as the success replies' messages are.
+fn notSaved(res: *httpz.Response, status: u16, msg: []const u8) !void {
+    res.status = status;
+    const message = try std.fmt.allocPrint(res.arena, "Not saved to vinboard: {s}", .{msg});
+    try res.json(.{ .@"error" = msg, .message = message }, .{});
 }
 
 pub fn list(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
