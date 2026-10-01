@@ -120,9 +120,10 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .{html_mod.prefixUtf8(body.url, 200)},
     ));
     const now = db_mod.nowUnix();
-    // A caller that brought no tags for a new url gets the model's, decided
-    // before the database lock is taken and held for the write.
-    const bookmark_tags = if (body.tags.len > 0) body.tags else suggested: {
+    // A caller that brought no tags for a new url, or only tags naming where
+    // it came from, gets the model's, decided before the database lock is
+    // taken and held for the write.
+    const bookmark_tags = if (!suggest_mod.wantsSuggestions(app.suggest, body.tags)) body.tags else suggested: {
         app.db_mutex.lockUncancelable(app.io);
         const uid = apiUserId(app, req);
         const saved_before = if (uid) |u|
@@ -130,8 +131,8 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         else
             false;
         app.db_mutex.unlock(app.io);
-        if (saved_before) break :suggested &.{};
-        break :suggested if (uid) |u| suggest_mod.forBookmark(
+        if (saved_before) break :suggested body.tags;
+        break :suggested if (uid) |u| try suggest_mod.withSuggested(res.arena, body.tags, suggest_mod.forBookmark(
             res.arena,
             app.io,
             app.suggest,
@@ -141,7 +142,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             body.title,
             body.url,
             body.notes,
-        ) else &.{};
+        )) else body.tags;
     };
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);

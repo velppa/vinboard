@@ -36,7 +36,54 @@ pub const Config = struct {
     trust: f64 = 0.8,
     /// Most tags to suggest.
     limit: usize = 3,
+    /// Tags that say where a bookmark came from rather than what it is
+    /// about.  A bookmark saved with only these still gets suggestions.
+    source_tags: []const []const u8 = &.{"hn"},
 };
+
+/// Whether a new bookmark saved with TAGS should get the model's too: it
+/// has none, or only ones naming where it came from.
+pub fn wantsSuggestions(cfg: Config, tags: []const []const u8) bool {
+    for (tags) |t| {
+        const source = for (cfg.source_tags) |src| {
+            if (std.ascii.eqlIgnoreCase(src, t)) break true;
+        } else false;
+        if (!source) return false;
+    }
+    return true;
+}
+
+/// TAGS, then each of SUGGESTED that TAGS lacks, ignoring case.
+pub fn withSuggested(alloc: std.mem.Allocator, tags: []const []const u8, suggested: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(alloc, tags);
+    for (suggested) |t| {
+        const have = for (out.items) |o| {
+            if (std.ascii.eqlIgnoreCase(o, t)) break true;
+        } else false;
+        if (!have) try out.append(alloc, t);
+    }
+    return out.items;
+}
+
+test "source tags alone still ask for suggestions" {
+    const cfg: Config = .{};
+    try testing.expect(wantsSuggestions(cfg, &.{}));
+    try testing.expect(wantsSuggestions(cfg, &.{"hn"}));
+    try testing.expect(wantsSuggestions(cfg, &.{"HN"}));
+    try testing.expect(!wantsSuggestions(cfg, &.{ "hn", "zig" }));
+    try testing.expect(!wantsSuggestions(cfg, &.{"zig"}));
+}
+
+test "suggestions join the given tags without repeating them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const tags = try withSuggested(arena.allocator(), &.{"hn"}, &.{ "HN", "zig", "llm" });
+    try testing.expectEqual(@as(usize, 3), tags.len);
+    try testing.expectEqualStrings("hn", tags[0]);
+    try testing.expectEqualStrings("zig", tags[1]);
+    try testing.expectEqualStrings("llm", tags[2]);
+}
 
 /// The text the model decides on. Enough to recognise a page by, in the
 /// order a reader would meet it.

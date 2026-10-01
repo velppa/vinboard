@@ -142,8 +142,9 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var tag_it = std.mem.tokenizeScalar(u8, tags_str, ' ');
     while (tag_it.next()) |t| try tag_list.append(res.arena, t);
     var tags: []const []const u8 = try tag_list.toOwnedSlice(res.arena);
-    // Pinboard clients that post a new url without tags get the model's.
-    if (tags.len == 0) {
+    // Pinboard clients that post a new url without tags, or with only tags
+    // naming where it came from, get the model's.
+    if (suggest_mod.wantsSuggestions(app.suggest, tags)) {
         app.db_mutex.lockUncancelable(app.io);
         const uid = api.apiUserId(app, req);
         const saved_before = if (uid) |u|
@@ -152,7 +153,7 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             false;
         app.db_mutex.unlock(app.io);
         if (uid) |u| if (!saved_before) {
-            tags = suggest_mod.forBookmark(res.arena, app.io, app.suggest, app.db, app.db_mutex, u, description, url, extended);
+            tags = try suggest_mod.withSuggested(res.arena, tags, suggest_mod.forBookmark(res.arena, app.io, app.suggest, app.db, app.db_mutex, u, description, url, extended));
         };
     }
 
