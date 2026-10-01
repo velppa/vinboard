@@ -862,7 +862,7 @@ pub fn editSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
     _ = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
     const new_url = fd.get("url") orelse "";
-    db_mod.updateBookmark(app.db, id, .{
+    db_mod.editBookmark(app.db, a, id, .{
         .url = if (new_url.len > 0) new_url else null,
         .title = try oneLine(a, fd.get("title") orelse ""),
         .notes = fd.get("notes") orelse "",
@@ -1043,7 +1043,7 @@ pub fn addSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const now = db_mod.nowUnix();
     // Re-adding an existing url updates it, matching Pinboard.
     if (db_mod.findIdByUrlFor(app.db, url, owner_uid) catch |e| return serverError(res, e)) |id| {
-        db_mod.updateBookmark(app.db, id, patch, now) catch |e| return serverError(res, e);
+        db_mod.editBookmark(app.db, a, id, patch, now) catch |e| return serverError(res, e);
     } else {
         const id = db_mod.insertBookmark(app.db, .{
             .url = url,

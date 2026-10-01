@@ -56,8 +56,8 @@ const CreateBody = struct {
     url: []const u8,
     title: []const u8 = "",
     notes: []const u8 = "",
-    toread: bool = false,
-    shared: bool = false,
+    toread: ?bool = null,
+    shared: ?bool = null,
     tags: []const []const u8 = &.{},
 };
 
@@ -133,12 +133,17 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .{prefixUtf8(body.url, 200)},
     ));
     const now = db_mod.nowUnix();
-    // A caller that brought no tags gets the model's, decided before the
-    // database lock is taken and held for the write.
+    // A caller that brought no tags for a new url gets the model's, decided
+    // before the database lock is taken and held for the write.
     const bookmark_tags = if (body.tags.len > 0) body.tags else suggested: {
         app.db_mutex.lockUncancelable(app.io);
         const uid = apiUserId(app, req);
+        const saved_before = if (uid) |u|
+            (db_mod.findIdByUrlFor(app.db, body.url, u) catch null) != null
+        else
+            false;
         app.db_mutex.unlock(app.io);
+        if (saved_before) break :suggested &.{};
         break :suggested if (uid) |u| suggest_mod.forBookmark(
             res.arena,
             app.io,
@@ -156,7 +161,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const auth_uid = apiUserId(app, req) orelse return notSaved(res, 401, "unauthorized");
     // Re-posting a url the user already saved updates it (Pinboard semantics).
     if (db_mod.findIdByUrlFor(app.db, body.url, auth_uid) catch |e| return dbError(res, e)) |existing| {
-        db_mod.updateBookmark(app.db, existing, .{
+        db_mod.resaveBookmark(app.db, existing, .{
             .title = body.title,
             .notes = body.notes,
             .toread = body.toread,
@@ -172,8 +177,8 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .url = body.url,
         .title = body.title,
         .notes = body.notes,
-        .toread = body.toread,
-        .shared = body.shared,
+        .toread = body.toread orelse false,
+        .shared = body.shared orelse false,
         .tags = bookmark_tags,
     }, now, auth_uid) catch |e| return dbError(res, e);
     db_mod.enqueueArchive(app.db, body.url) catch {};
@@ -253,7 +258,7 @@ pub fn patch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const auth_uid = apiUserId(app, req) orelse return unauthorized(res);
     const owned = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
     if (owned.user_id != auth_uid) return notFound(res);
-    db_mod.updateBookmark(app.db, id, .{
+    db_mod.editBookmark(app.db, res.arena, id, .{
         .url = body.url,
         .title = body.title,
         .notes = body.notes,

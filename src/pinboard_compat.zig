@@ -142,12 +142,18 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var tag_it = std.mem.tokenizeScalar(u8, tags_str, ' ');
     while (tag_it.next()) |t| try tag_list.append(res.arena, t);
     var tags: []const []const u8 = try tag_list.toOwnedSlice(res.arena);
-    // Pinboard clients that post without tags get the model's.
+    // Pinboard clients that post a new url without tags get the model's.
     if (tags.len == 0) {
         app.db_mutex.lockUncancelable(app.io);
         const uid = api.apiUserId(app, req);
+        const saved_before = if (uid) |u|
+            (db_mod.findIdByUrlFor(app.db, url, u) catch null) != null
+        else
+            false;
         app.db_mutex.unlock(app.io);
-        if (uid) |u| tags = suggest_mod.forBookmark(res.arena, app.io, app.suggest, app.db, app.db_mutex, u, description, url, extended);
+        if (uid) |u| if (!saved_before) {
+            tags = suggest_mod.forBookmark(res.arena, app.io, app.suggest, app.db, app.db_mutex, u, description, url, extended);
+        };
     }
 
     // Parse created_at
@@ -172,12 +178,12 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             return;
         }
         // Update
-        try db_mod.updateBookmark(app.db, existing_id, .{
+        try db_mod.resaveBookmark(app.db, existing_id, .{
             .title = description,
             .notes = extended,
             .tags = tags,
-            .shared = shared,
-            .toread = toread,
+            .shared = if (qs.get("shared") != null) shared else null,
+            .toread = if (qs.get("toread") != null) toread else null,
         }, now);
     } else {
         // Insert

@@ -66,6 +66,9 @@ pub fn migrate(db: *sqlite.Db) !void {
     if (!try hasColumn(db, "bookmark", "starred")) {
         try db.exec("ALTER TABLE bookmark ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;");
     }
+    if (!try hasColumn(db, "bookmark", "edited")) {
+        try db.exec("ALTER TABLE bookmark ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;");
+    }
     if (!try hasColumn(db, "bookmark", "user_id")) {
         try db.exec("ALTER TABLE bookmark ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1;");
     }
@@ -475,6 +478,101 @@ pub fn updateBookmark(db: *sqlite.Db, id: i64, p: Patch, now: i64) !void {
     if (p.tags) |tg| try replaceTags(db, id, tg);
     try setInt(db, id, "updated_at", now);
     try reindex(db, id);
+}
+
+/// Fields of a bookmark a person has set by hand, as bits of its `edited`
+/// column.  A client saving the url again leaves them alone.
+pub const Edited = struct {
+    pub const title: i64 = 1;
+    pub const notes: i64 = 2;
+    pub const tags: i64 = 4;
+    pub const toread: i64 = 8;
+    pub const shared: i64 = 16;
+};
+
+/// Apply a person's edit, remembering which fields it changed.
+pub fn editBookmark(db: *sqlite.Db, alloc: std.mem.Allocator, id: i64, p: Patch, now: i64) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cur = (try getBookmark(db, arena.allocator(), id)) orelse return;
+    var mask: i64 = 0;
+    if (p.title) |v| if (!std.mem.eql(u8, v, cur.title)) {
+        mask |= Edited.title;
+    };
+    if (p.notes) |v| if (!std.mem.eql(u8, v, cur.notes)) {
+        mask |= Edited.notes;
+    };
+    if (p.tags) |v| if (!sameTags(v, cur.tags)) {
+        mask |= Edited.tags;
+    };
+    if (p.toread) |v| if (v != cur.toread) {
+        mask |= Edited.toread;
+    };
+    if (p.shared) |v| if (v != cur.shared) {
+        mask |= Edited.shared;
+    };
+    if (mask != 0) {
+        var q = try db.prepare("UPDATE bookmark SET edited = edited | ? WHERE id=?;");
+        defer q.finalize();
+        q.bindInt(1, mask);
+        q.bindInt(2, id);
+        _ = try q.step();
+    }
+    try updateBookmark(db, id, p, now);
+}
+
+/// Apply what a client sent when saving a url again: fields a person edited
+/// by hand stay as they are, and empty values never blank a field.
+pub fn resaveBookmark(db: *sqlite.Db, id: i64, p: Patch, now: i64) !void {
+    var q = try db.prepare("SELECT edited FROM bookmark WHERE id=?;");
+    defer q.finalize();
+    q.bindInt(1, id);
+    if (!try q.step()) return;
+    const mask = q.columnInt(0);
+    var r = p;
+    if (mask & Edited.title != 0 or (r.title != null and r.title.?.len == 0)) r.title = null;
+    if (mask & Edited.notes != 0 or (r.notes != null and r.notes.?.len == 0)) r.notes = null;
+    if (mask & Edited.tags != 0 or (r.tags != null and r.tags.?.len == 0)) r.tags = null;
+    if (mask & Edited.toread != 0) r.toread = null;
+    if (mask & Edited.shared != 0) r.shared = null;
+    try updateBookmark(db, id, r, now);
+}
+
+fn sameTags(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    outer: for (a) |x| {
+        for (b) |y| if (std.mem.eql(u8, x, y)) continue :outer;
+        return false;
+    }
+    return true;
+}
+
+test "resave keeps hand-edited fields" {
+    var db = try testDb();
+    defer db.close();
+    const id = try insertBookmark(&db, .{ .url = "https://e", .title = "Browser", .tags = &.{"auto"} }, 1, 1);
+    try editBookmark(&db, testing.allocator, id, .{ .title = "Mine", .tags = &.{ "auto", "kept" }, .notes = "" }, 2);
+    try resaveBookmark(&db, id, .{ .title = "Browser again", .notes = "from client", .tags = &.{"other"}, .toread = true }, 3);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bm = (try getBookmark(&db, arena.allocator(), id)).?;
+    try testing.expectEqualStrings("Mine", bm.title);
+    try testing.expectEqual(@as(usize, 2), bm.tags.len);
+    // Notes were submitted unchanged, so they are not marked and the client's win.
+    try testing.expectEqualStrings("from client", bm.notes);
+    try testing.expect(bm.toread);
+}
+
+test "resave never blanks a field" {
+    var db = try testDb();
+    defer db.close();
+    const id = try insertBookmark(&db, .{ .url = "https://f", .title = "Kept", .tags = &.{"t"} }, 1, 1);
+    try resaveBookmark(&db, id, .{ .title = "", .tags = &.{} }, 2);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bm = (try getBookmark(&db, arena.allocator(), id)).?;
+    try testing.expectEqualStrings("Kept", bm.title);
+    try testing.expectEqual(@as(usize, 1), bm.tags.len);
 }
 
 fn setText(db: *sqlite.Db, id: i64, col: []const u8, v: []const u8) !void {
