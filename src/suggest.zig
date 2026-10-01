@@ -31,6 +31,9 @@ pub const Config = struct {
     shortlist: usize = 5,
     /// Lowest yes/no probability worth suggesting.
     threshold: f64 = 0.5,
+    /// Ranking probability above which a tag is suggested whatever the
+    /// yes/no pass says.
+    trust: f64 = 0.8,
     /// Most tags to suggest.
     limit: usize = 3,
 };
@@ -233,9 +236,12 @@ fn confirm(
 
     var kept: std.ArrayList(Scored) = .empty;
     for (short, 0..) |cand, i| {
-        const a = answer(parsed, try key(alloc, i)) orelse continue;
-        const p = number(a.object.get("noul") orelse continue);
-        if (p >= cfg.threshold) try kept.append(alloc, .{ .tag = cand.tag, .p = p });
+        const yes: f64 = if (answer(parsed, try key(alloc, i))) |a|
+            if (a.object.get("noul")) |v| number(v) else 0
+        else
+            0;
+        if (yes >= cfg.threshold or cand.p >= cfg.trust)
+            try kept.append(alloc, .{ .tag = cand.tag, .p = @max(yes, cand.p) });
     }
     std.mem.sort(Scored, kept.items, {}, byProbability);
 
@@ -312,6 +318,24 @@ test "confirmation keeps what clears the threshold, best first" {
     try testing.expectEqual(@as(usize, 2), tags.len);
     try testing.expectEqualStrings("ai", tags[0]);
     try testing.expectEqualStrings("ml", tags[1]);
+}
+
+test "a confident ranking survives an unconvinced yes/no" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const json =
+        \\{"answers":{"q0":{"type":"noul","noul":0.26},
+        \\ "q1":{"type":"noul","noul":0.27}}}
+    ;
+    const short = [_]Scored{
+        .{ .tag = "u/someone", .p = 0.95 },
+        .{ .tag = "photo", .p = 0.03 },
+    };
+    const tags = try confirm(a, json, &short, .{ .threshold = 0.5, .trust = 0.8 });
+    try testing.expectEqual(@as(usize, 1), tags.len);
+    try testing.expectEqualStrings("u/someone", tags[0]);
 }
 
 test "confirmation returns nothing when the model is unconvinced" {
