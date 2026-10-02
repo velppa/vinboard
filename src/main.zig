@@ -183,4 +183,5 @@ test {
     _ = @import("auth.zig");
     _ = @import("oidc.zig");
     _ = @import("suggest.zig");
+    _ = @import("trackers.zig");
 }

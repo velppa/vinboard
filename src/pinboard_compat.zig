@@ -3,6 +3,7 @@ const httpz = @import("httpz");
 const server = @import("server.zig");
 const api = @import("api.zig");
 const db_mod = @import("db.zig");
+const trackers = @import("trackers.zig");
 const suggest_mod = @import("suggest.zig");
 const import_mod = @import("import.zig");
 
@@ -124,11 +125,11 @@ fn postsAll(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 // GET /v1/posts/add → {"result_code":"done"} or {"result_code":"item already exists"}
 fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const qs = try req.query();
-    const url = qs.get("url") orelse {
+    const url = try trackers.clean(res.arena, qs.get("url") orelse {
         res.status = 400;
         try res.json(.{ .result_code = "missing url" }, .{});
         return;
-    };
+    });
     const description = qs.get("description") orelse "";
     const extended = qs.get("extended") orelse "";
     const tags_str = qs.get("tags") orelse "";
@@ -206,11 +207,11 @@ fn postsAdd(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 // GET /v1/posts/delete?url=X → {"result_code":"done"} or {"result_code":"item not found"}
 fn postsDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const qs = try req.query();
-    const url = qs.get("url") orelse {
+    const url = try trackers.clean(res.arena, qs.get("url") orelse {
         res.status = 400;
         try res.json(.{ .result_code = "missing url" }, .{});
         return;
-    };
+    });
 
     app.db_mutex.lockUncancelable(app.io);
     defer app.db_mutex.unlock(app.io);

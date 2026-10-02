@@ -2,6 +2,7 @@ const std = @import("std");
 const sqlite = @import("sqlite.zig");
 const gzip = @import("gzip.zig");
 const models = @import("models.zig");
+const trackers = @import("trackers.zig");
 
 pub const SCHEMA: [:0]const u8 =
     \\PRAGMA journal_mode=WAL;
@@ -117,6 +118,92 @@ pub fn migrate(db: *sqlite.Db) !void {
     try db.exec("INSERT OR IGNORE INTO user(id, handle) VALUES (1, 'velppa');");
     try moveArchive(db);
     try compressStoredPages(db);
+    try cleanTrackedUrls(db);
+}
+
+/// Strip tracking parameters from every saved url.  A bookmark whose clean
+/// url its owner already has is folded into that one: its tags join it, and
+/// it goes.  Only urls that change are touched, so running on every start
+/// costs one scan.
+fn cleanTrackedUrls(db: *sqlite.Db) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Row = struct { id: i64, user_id: i64, url: []const u8, clean: []const u8 };
+    var rows: std.ArrayList(Row) = .empty;
+    {
+        var q = try db.prepare("SELECT id, user_id, url FROM bookmark WHERE url LIKE '%?%' OR url LIKE '%#%';");
+        defer q.finalize();
+        while (try q.step()) {
+            const url = try a.dupe(u8, q.columnText(2));
+            const clean = try trackers.clean(a, url);
+            if (clean.ptr != url.ptr) try rows.append(a, .{
+                .id = q.columnInt(0),
+                .user_id = q.columnInt(1),
+                .url = url,
+                .clean = clean,
+            });
+        }
+    }
+    if (rows.items.len == 0) return;
+
+    try db.exec("BEGIN;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    var merged: usize = 0;
+    for (rows.items) |r| {
+        if (try findIdByUrlFor(db, r.clean, r.user_id)) |keep| {
+            var tags = try db.prepare("INSERT OR IGNORE INTO tag(bookmark_id, tag) SELECT ?1, tag FROM tag WHERE bookmark_id=?2;");
+            defer tags.finalize();
+            tags.bindInt(1, keep);
+            tags.bindInt(2, r.id);
+            _ = try tags.step();
+            var drop = try db.prepare("DELETE FROM tag WHERE bookmark_id=?;");
+            defer drop.finalize();
+            drop.bindInt(1, r.id);
+            _ = try drop.step();
+            try deleteBookmark(db, r.id);
+            try reindex(db, keep);
+            merged += 1;
+        } else {
+            try setText(db, r.id, "url", r.clean);
+            try reindex(db, r.id);
+        }
+        // The page copy follows the url, unless the clean url has one already.
+        var move = try db.prepare("UPDATE OR IGNORE archive SET url=?1 WHERE url=?2;");
+        defer move.finalize();
+        move.bindText(1, r.clean);
+        move.bindText(2, r.url);
+        _ = try move.step();
+        var stale = try db.prepare("DELETE FROM archive WHERE url=?;");
+        defer stale.finalize();
+        stale.bindText(1, r.url);
+        _ = try stale.step();
+    }
+    try db.exec("COMMIT;");
+    std.log.info("cleaned tracking parameters from {d} urls ({d} merged into bookmarks already saved)", .{ rows.items.len, merged });
+}
+
+test "migrate strips tracking parameters and folds duplicates" {
+    var db = try testDb();
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kept = try insertBookmark(&db, .{ .url = "https://x.test/a", .tags = &.{"mine"} }, 1, 1);
+    const dup = try insertBookmark(&db, .{ .url = "https://x.test/a?utm_source=hn", .tags = &.{"hn"} }, 2, 1);
+    const lone = try insertBookmark(&db, .{ .url = "https://x.test/b?id=1&fbclid=z" }, 3, 1);
+    const other = try insertBookmark(&db, .{ .url = "https://x.test/a?utm_source=hn" }, 4, 2);
+    try db.exec("INSERT INTO archive(url,html,text,status) VALUES ('https://x.test/b?id=1&fbclid=z','p','t','done');");
+    try migrate(&db);
+
+    try testing.expect((try getBookmark(&db, a, dup)) == null);
+    try testing.expectEqual(@as(usize, 2), (try getBookmark(&db, a, kept)).?.tags.len);
+    try testing.expectEqualStrings("https://x.test/b?id=1", (try getBookmark(&db, a, lone)).?.url);
+    try testing.expectEqualStrings("https://x.test/a", (try getBookmark(&db, a, other)).?.url);
+    var q = try db.prepare("SELECT count(*) FROM archive WHERE url='https://x.test/b?id=1';");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 1), q.columnInt(0));
 }
 
 /// One-off pass: compress page copies stored before compression

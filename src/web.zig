@@ -3,6 +3,7 @@ const httpz = @import("httpz");
 const server = @import("server.zig");
 const db_mod = @import("db.zig");
 const suggest_mod = @import("suggest.zig");
+const trackers = @import("trackers.zig");
 const models = @import("models.zig");
 const html = @import("html.zig");
 const auth = @import("auth.zig");
@@ -893,7 +894,7 @@ pub fn editSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer app.db_mutex.unlock(app.io);
     const owner_uid = sessionUserId(app, req) orelse return loginRequired(res);
     _ = (ownedBookmark(app, a, id, owner_uid) catch |e| return serverError(res, e)) orelse return notFound(res);
-    const new_url = fd.get("url") orelse "";
+    const new_url = try trackers.clean(a, fd.get("url") orelse "");
     db_mod.editBookmark(app.db, a, id, .{
         .url = if (new_url.len > 0) new_url else null,
         .title = try oneLine(a, fd.get("title") orelse ""),
@@ -948,7 +949,7 @@ pub fn deleteSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
 pub fn addPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
     const qs = try req.query();
-    const url = qs.get("url") orelse "";
+    const url = try trackers.clean(a, qs.get("url") orelse "");
     const popup = qs.get("popup") != null;
 
     var st = Settings{};
@@ -1048,7 +1049,7 @@ pub fn addPage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 pub fn addSubmit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
     const fd = try req.formData();
-    const url = fd.get("url") orelse return badRequest(res);
+    const url = try trackers.clean(a, fd.get("url") orelse return badRequest(res));
     if (url.len == 0) return badRequest(res);
     const title = try oneLine(a, fd.get("title") orelse "");
     const notes = fd.get("notes") orelse "";
@@ -1476,7 +1477,7 @@ pub fn tagsJson(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 pub fn suggestJson(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const a = res.arena;
     const qs = try req.query();
-    const url = qs.get("url") orelse "";
+    const url = try trackers.clean(a, qs.get("url") orelse "");
 
     app.db_mutex.lockUncancelable(app.io);
     const uid = sessionUserId(app, req);

@@ -2,6 +2,7 @@ const std = @import("std");
 const models = @import("models.zig");
 const db_mod = @import("db.zig");
 const sqlite = @import("sqlite.zig");
+const trackers = @import("trackers.zig");
 
 pub const Imported = struct {
     items: []models.NewBookmark,
@@ -30,7 +31,7 @@ pub fn parsePinboard(gpa: std.mem.Allocator, json: []const u8) !Imported {
         var it = std.mem.tokenizeScalar(u8, tags_str, ' ');
         while (it.next()) |tg| try tag_list.append(a, tg);
         items[i] = .{
-            .url = (o.get("href") orelse return error.MissingHref).string,
+            .url = try trackers.clean(a, (o.get("href") orelse return error.MissingHref).string),
             .title = if (o.get("description")) |d| d.string else "",
             .notes = if (o.get("extended")) |e| e.string else "",
             .toread = if (o.get("toread")) |t| yesNo(t.string) else false,
@@ -74,7 +75,7 @@ pub fn parseSafari(gpa: std.mem.Allocator, json: []const u8) !Imported {
     for (arr.items, 0..) |v, i| {
         const o = v.object;
         items[i] = .{
-            .url = (o.get("url") orelse return error.MissingUrl).string,
+            .url = try trackers.clean(a, (o.get("url") orelse return error.MissingUrl).string),
             .title = if (o.get("title")) |t| t.string else "",
             .tags = &.{},
         };

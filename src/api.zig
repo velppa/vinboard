@@ -3,6 +3,7 @@ const httpz = @import("httpz");
 const server = @import("server.zig");
 const db_mod = @import("db.zig");
 const suggest_mod = @import("suggest.zig");
+const trackers = @import("trackers.zig");
 const gzip = @import("gzip.zig");
 const models = @import("models.zig");
 const html_mod = @import("html.zig");
@@ -111,7 +112,7 @@ pub fn create(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var body = (try req.json(CreateBody)) orelse return notSaved(res, 400, "invalid json");
     // Share sheets often hand over the page as "<title><url>" text.
     const shared = splitShared(body.url, body.title);
-    body.url = shared.url;
+    body.url = try trackers.clean(res.arena, shared.url);
     body.title = shared.title;
     if (body.url.len == 0) return notSaved(res, 400, "url is required");
     if (!isWebUrl(body.url)) return notSaved(res, 400, try std.fmt.allocPrint(
@@ -247,7 +248,7 @@ pub fn patch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const owned = (db_mod.getBookmark(app.db, res.arena, id) catch |e| return dbError(res, e)) orelse return notFound(res);
     if (owned.user_id != auth_uid) return notFound(res);
     db_mod.editBookmark(app.db, res.arena, id, .{
-        .url = body.url,
+        .url = if (body.url) |u| try trackers.clean(res.arena, u) else null,
         .title = body.title,
         .notes = body.notes,
         .toread = body.toread,
