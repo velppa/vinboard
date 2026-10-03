@@ -9,7 +9,8 @@
 ;;   (vinboard-archive-start URL FILE)
 ;;
 ;; returns at once; FILE appears when the capture is done, or FILE.err
-;; with the reason when it failed.
+;; with the reason when it failed.  FILE.url, written just before FILE,
+;; holds the url the tab ended on, after any redirects.
 
 ;;; Code:
 
@@ -76,29 +77,31 @@ FILE.err receives the reason when the capture fails."
                             (string-match-p vinboard-archive-challenge-re
                                             (or (plist-get tab :title) "")))
                        (fail "a bot check did not clear; pass it in the browser and retry" id))
-                      ((> (float-time) deadline) (scroll id))
+                      ((> (float-time) deadline) (scroll id (plist-get tab :url)))
                       ((and (equal (plist-get tab :status) "complete")
                             (not (string-match-p vinboard-archive-challenge-re
                                                  (or (plist-get tab :title) ""))))
-                       (scroll id))
+                       (scroll id (plist-get tab :url)))
                       (t (run-at-time 0.5 nil #'wait id deadline)))))))
-         (scroll (id)
+         (scroll (id final)
            (vinboard-archive--request
             "EVAL_IN_ACTIVE_TAB" (list :tabId id :code vinboard-archive--scroll-js)
             (lambda (_)
-              (run-at-time vinboard-archive-settle nil #'capture id 3))))
-         (capture (id tries)
+              (run-at-time vinboard-archive-settle nil #'capture id 3 final))))
+         (capture (id tries final)
            (vinboard-archive--request
             "CAPTURE_MHTML" (list :tabId id)
             (lambda (r)
               (cond
                ((and (not (ok-p r)) (> tries 1))
                 ;; Capturing fails now and then on a page that just loaded.
-                (run-at-time 1 nil #'capture id (1- tries)))
+                (run-at-time 1 nil #'capture id (1- tries) final))
                ((not (ok-p r))
                 (fail (or (plist-get r :message) (format "%S" r)) id))
                (t
                 (let ((coding-system-for-write 'utf-8-unix))
+                  (when (stringp final)
+                    (with-temp-file (concat file ".url") (insert final)))
                   (with-temp-file file (insert (plist-get r :mhtml))))
                 (vinboard-archive--close id)))))))
       (vinboard-archive--request

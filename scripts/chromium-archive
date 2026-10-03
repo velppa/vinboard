@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Archive a page through the browser connected to Emacs by browser-gt.
 
-    chromium-archive URL [ignored...]   print the rendered page as html
+    chromium-archive URL [ignored...]   print the rendered page as html, and
+                                        "vinboard-final-url: URL" on stderr
     chromium-archive --mhtml FILE       convert a saved MHTML file instead
 
 The page is rendered with the browser's own logins and cookies, captured as
@@ -26,7 +27,7 @@ TIMEOUT = float(os.environ.get("VINBOARD_ARCHIVE_TIMEOUT", "150"))
 
 
 def capture(url):
-    """MHTML text of URL as the browser renders it."""
+    """MHTML of URL as the browser renders it, and the url it ended on."""
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "page.mhtml")
         form = '(progn (load %s nil t) (vinboard-archive-start %s %s))' % (
@@ -40,8 +41,12 @@ def capture(url):
                     raise RuntimeError(f.read())
             if os.path.exists(out):
                 time.sleep(0.2)  # let the writer finish
+                final = None
+                if os.path.exists(out + ".url"):
+                    with open(out + ".url", encoding="utf-8", errors="replace") as f:
+                        final = f.read().strip() or None
                 with open(out, "rb") as f:
-                    return f.read()
+                    return f.read(), final
             time.sleep(0.5)
         raise RuntimeError("timed out waiting for the capture")
 
@@ -124,10 +129,12 @@ def main(argv):
             mhtml = f.read()
     elif len(argv) >= 2 and not argv[1].startswith("-"):
         try:
-            mhtml = capture(argv[1])
+            mhtml, final = capture(argv[1])
         except Exception as e:
             print("chromium-archive: %s" % e, file=sys.stderr)
             return 1
+        if final:
+            print("vinboard-final-url: %s" % final, file=sys.stderr)
     else:
         print(__doc__.strip(), file=sys.stderr)
         return 2

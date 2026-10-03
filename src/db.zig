@@ -151,36 +151,89 @@ fn cleanTrackedUrls(db: *sqlite.Db) !void {
     errdefer db.exec("ROLLBACK;") catch {};
     var merged: usize = 0;
     for (rows.items) |r| {
-        if (try findIdByUrlFor(db, r.clean, r.user_id)) |keep| {
-            var tags = try db.prepare("INSERT OR IGNORE INTO tag(bookmark_id, tag) SELECT ?1, tag FROM tag WHERE bookmark_id=?2;");
-            defer tags.finalize();
-            tags.bindInt(1, keep);
-            tags.bindInt(2, r.id);
-            _ = try tags.step();
-            var drop = try db.prepare("DELETE FROM tag WHERE bookmark_id=?;");
-            defer drop.finalize();
-            drop.bindInt(1, r.id);
-            _ = try drop.step();
-            try deleteBookmark(db, r.id);
-            try reindex(db, keep);
-            merged += 1;
-        } else {
-            try setText(db, r.id, "url", r.clean);
-            try reindex(db, r.id);
-        }
-        // The page copy follows the url, unless the clean url has one already.
-        var move = try db.prepare("UPDATE OR IGNORE archive SET url=?1 WHERE url=?2;");
-        defer move.finalize();
-        move.bindText(1, r.clean);
-        move.bindText(2, r.url);
-        _ = try move.step();
-        var stale = try db.prepare("DELETE FROM archive WHERE url=?;");
-        defer stale.finalize();
-        stale.bindText(1, r.url);
-        _ = try stale.step();
+        if (try rehome(db, r.id, r.user_id, r.clean)) merged += 1;
+        try moveArchiveRow(db, r.url, r.clean);
     }
     try db.exec("COMMIT;");
     std.log.info("cleaned tracking parameters from {d} urls ({d} merged into bookmarks already saved)", .{ rows.items.len, merged });
+}
+
+/// Point bookmark ID, owned by USER_ID, at URL.  When the user already has
+/// a bookmark there, ID is folded into it instead: its tags join that one,
+/// and it goes.  Returns whether it was folded.
+fn rehome(db: *sqlite.Db, id: i64, user_id: i64, url: []const u8) !bool {
+    if (try findIdByUrlFor(db, url, user_id)) |keep| {
+        if (keep == id) return false;
+        var tags = try db.prepare("INSERT OR IGNORE INTO tag(bookmark_id, tag) SELECT ?1, tag FROM tag WHERE bookmark_id=?2;");
+        defer tags.finalize();
+        tags.bindInt(1, keep);
+        tags.bindInt(2, id);
+        _ = try tags.step();
+        var drop = try db.prepare("DELETE FROM tag WHERE bookmark_id=?;");
+        defer drop.finalize();
+        drop.bindInt(1, id);
+        _ = try drop.step();
+        try deleteBookmark(db, id);
+        try reindex(db, keep);
+        return true;
+    }
+    try setText(db, id, "url", url);
+    try reindex(db, id);
+    return false;
+}
+
+/// Move the archived copy of OLD to NEW, unless NEW has one already.
+fn moveArchiveRow(db: *sqlite.Db, old: []const u8, new: []const u8) !void {
+    var move = try db.prepare("UPDATE OR IGNORE archive SET url=?1 WHERE url=?2;");
+    defer move.finalize();
+    move.bindText(1, new);
+    move.bindText(2, old);
+    _ = try move.step();
+    var stale = try db.prepare("DELETE FROM archive WHERE url=?;");
+    defer stale.finalize();
+    stale.bindText(1, old);
+    _ = try stale.step();
+}
+
+/// Move every bookmark saved as OLD to NEW, with its archived copy,
+/// folding it into the bookmark its owner already has at NEW.  Returns how
+/// many were folded.
+pub fn moveUrl(db: *sqlite.Db, alloc: std.mem.Allocator, old: []const u8, new: []const u8) !usize {
+    var rows: std.ArrayList([2]i64) = .empty;
+    defer rows.deinit(alloc);
+    {
+        var q = try db.prepare("SELECT id, user_id FROM bookmark WHERE url=?;");
+        defer q.finalize();
+        q.bindText(1, old);
+        while (try q.step()) try rows.append(alloc, .{ q.columnInt(0), q.columnInt(1) });
+    }
+    try db.exec("BEGIN;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    var merged: usize = 0;
+    for (rows.items) |r| {
+        if (try rehome(db, r[0], r[1], new)) merged += 1;
+    }
+    try moveArchiveRow(db, old, new);
+    try db.exec("COMMIT;");
+    return merged;
+}
+
+test "moveUrl folds a share link into the post already saved" {
+    var db = try testDb();
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const post = try insertBookmark(&db, .{ .url = "https://r.test/comments/1/", .tags = &.{"lisp"} }, 1, 1);
+    const share = try insertBookmark(&db, .{ .url = "https://r.test/s/abc", .tags = &.{"clojure"} }, 2, 1);
+    try db.exec("INSERT INTO archive(url,html,text,status) VALUES ('https://r.test/s/abc','p','t','done');");
+    try testing.expectEqual(@as(usize, 1), try moveUrl(&db, a, "https://r.test/s/abc", "https://r.test/comments/1/"));
+    try testing.expect((try getBookmark(&db, a, share)) == null);
+    try testing.expectEqual(@as(usize, 2), (try getBookmark(&db, a, post)).?.tags.len);
+    var q = try db.prepare("SELECT count(*) FROM archive WHERE url='https://r.test/comments/1/';");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 1), q.columnInt(0));
 }
 
 test "migrate strips tracking parameters and folds duplicates" {

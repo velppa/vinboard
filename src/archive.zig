@@ -2,6 +2,7 @@ const std = @import("std");
 const server = @import("server.zig");
 const db_mod = @import("db.zig");
 const strip = @import("strip.zig");
+const trackers = @import("trackers.zig");
 
 pub const Worker = struct {
     app: *server.App,
@@ -26,7 +27,9 @@ pub const Worker = struct {
     pub fn tick(self: *Worker) !void {
         const url = (try self.nextPending()) orelse return;
         defer self.app.gpa.free(url);
-        const html = self.fetch(url) catch |e| {
+        var final: ?[]u8 = null;
+        defer if (final) |f| self.app.gpa.free(f);
+        const html = self.fetch(url, &final) catch |e| {
             try self.markFailed(url, if (e == error.DeadLink) .dead else .failed);
             return;
         };
@@ -37,6 +40,15 @@ pub const Worker = struct {
         defer self.app.db_mutex.unlock(self.app.io);
         try db_mod.setArchive(self.app.db, url, html, text, .done, db_mod.nowUnix());
         try self.backfillTitles(url, html);
+        // A share link is saved under the post it led to, so sharing one post
+        // twice finds the bookmark made the first time.
+        if (final) |f| {
+            var arena = std.heap.ArenaAllocator.init(self.app.gpa);
+            defer arena.deinit();
+            if (try trackers.redditPost(arena.allocator(), url, f)) |post| {
+                _ = try db_mod.moveUrl(self.app.db, arena.allocator(), url, post);
+            }
+        }
     }
 
     /// Bookmarks saved without a title get one from the archived page.
@@ -70,8 +82,10 @@ pub const Worker = struct {
         try db_mod.setArchive(self.app.db, url, "", "", status, db_mod.nowUnix());
     }
 
-    /// Run the archiver, capture stdout HTML. Caller frees.
-    fn fetch(self: *Worker, url: []const u8) ![]u8 {
+    /// Run the archiver, capture stdout HTML. Caller frees.  FINAL receives
+    /// the url the page ended on, when the archiver reports one on stderr as
+    /// "vinboard-final-url: URL"; caller frees that too.
+    fn fetch(self: *Worker, url: []const u8, final: *?[]u8) ![]u8 {
         var secs_buf: [16]u8 = undefined;
         const secs = try std.fmt.bufPrint(&secs_buf, "{d}", .{self.timeout_secs});
         const argv: []const []const u8 = if (self.timeout_secs > 0)
@@ -81,10 +95,17 @@ pub const Worker = struct {
         const result = try std.process.run(self.app.gpa, self.app.io, .{
             .argv = argv,
             .stdout_limit = .limited(32 * 1024 * 1024),
-            .stderr_limit = .limited(1024),
+            .stderr_limit = .limited(16 * 1024),
         });
-        // Always free stderr; we don't use it.
-        self.app.gpa.free(result.stderr);
+        defer self.app.gpa.free(result.stderr);
+        var lines = std.mem.splitScalar(u8, result.stderr, '\n');
+        while (lines.next()) |line| {
+            const prefix = "vinboard-final-url: ";
+            if (std.mem.startsWith(u8, line, prefix)) {
+                final.* = try self.app.gpa.dupe(u8, std.mem.trim(u8, line[prefix.len..], " \r"));
+                break;
+            }
+        }
         switch (result.term) {
             .exited => |code| {
                 if (code == 3) {
@@ -120,6 +141,34 @@ test "extractTitle" {
 }
 
 const testing = std.testing;
+
+test "worker files a Reddit share link under the post it led to" {
+    var db = try db_mod.testDbPub();
+    defer db.close();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var mutex: std.Io.Mutex = .init;
+    var app = server.App{
+        .gpa = testing.allocator,
+        .db = &db,
+        .db_mutex = &mutex,
+        .io = threaded.io(),
+        .base_path = "",
+    };
+    const post = "https://www.reddit.com/r/test/comments/1abc/a_post/";
+    const saved = try db_mod.insertBookmark(&db, .{ .url = post, .tags = &.{"lisp"} }, 1, 1);
+    const shared = try db_mod.insertBookmark(&db, .{ .url = "https://www.reddit.com/r/test/s/XyZ", .tags = &.{"clojure"} }, 2, 1);
+    try db_mod.enqueueArchive(&db, "https://www.reddit.com/r/test/s/XyZ");
+
+    var w = Worker{ .app = &app, .archiver_cmd = "tests/fixtures/share-archiver.sh", .timeout_secs = 0 };
+    try w.tick();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try db_mod.getBookmark(&db, arena.allocator(), shared)) == null);
+    try testing.expectEqual(@as(usize, 2), (try db_mod.getBookmark(&db, arena.allocator(), saved)).?.tags.len);
+    try testing.expectEqual(db_mod.ArchiveState.done, try db_mod.archiveState(&db, saved));
+}
 
 test "worker archives a pending bookmark via stub" {
     var db = try db_mod.testDbPub();

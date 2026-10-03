@@ -91,3 +91,47 @@ test "clean returns the url itself when nothing tracks" {
     const bare = "https://x.test/";
     try std.testing.expect((try clean(std.testing.allocator, bare)).ptr == bare.ptr);
 }
+
+/// The post a Reddit share link (reddit.com/r/SUB/s/CODE) led to, given
+/// FINAL, the url the browser ended on: the permalink without its query,
+/// which only carries share and tracking ids.  Null when URL is not a share
+/// link or FINAL is not a post.
+pub fn redditPost(alloc: std.mem.Allocator, url: []const u8, final: []const u8) !?[]const u8 {
+    const share_path = redditPath(url) orelse return null;
+    var parts = std.mem.splitScalar(u8, std.mem.trim(u8, share_path, "/"), '/');
+    if (!std.mem.eql(u8, parts.next() orelse "", "r")) return null;
+    _ = parts.next() orelse return null;
+    if (!std.mem.eql(u8, parts.next() orelse "", "s")) return null;
+    const code: []const u8 = parts.next() orelse "";
+    if (code.len == 0 or parts.next() != null) return null;
+
+    const post_path = redditPath(final) orelse return null;
+    if (std.mem.indexOf(u8, post_path, "/comments/") == null) return null;
+    return try std.mem.concat(alloc, u8, &.{ "https://www.reddit.com", post_path });
+}
+
+/// The path of a reddit.com url, without query or fragment; null for other
+/// hosts.
+fn redditPath(url: []const u8) ?[]const u8 {
+    const rest = if (std.mem.startsWith(u8, url, "https://")) url[8..] else if (std.mem.startsWith(u8, url, "http://")) url[7..] else return null;
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const host = rest[0..slash];
+    if (!(std.ascii.eqlIgnoreCase(host, "reddit.com") or std.ascii.endsWithIgnoreCase(host, ".reddit.com"))) return null;
+    const path = rest[slash..];
+    const end = std.mem.indexOfAny(u8, path, "?#") orelse path.len;
+    return path[0..end];
+}
+
+test "redditPost follows a share link to its post" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "https://www.reddit.com/r/Clojure/comments/1wwav8e/stuart_halloway/",
+        (try redditPost(a, "https://www.reddit.com/r/Clojure/s/eG2JBkQIRI",
+            "https://www.reddit.com/r/Clojure/comments/1wwav8e/stuart_halloway/?share_id=x&utm_medium=ios_app")).?,
+    );
+    try std.testing.expect((try redditPost(a, "https://www.reddit.com/r/Clojure/comments/1/x/", "https://www.reddit.com/r/Clojure/comments/1/x/")) == null);
+    try std.testing.expect((try redditPost(a, "https://www.reddit.com/r/Clojure/s/eG2", "https://www.reddit.com/login/")) == null);
+    try std.testing.expect((try redditPost(a, "https://example.com/r/x/s/y", "https://www.reddit.com/r/x/comments/1/z/")) == null);
+}
